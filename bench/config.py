@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     backboard_api_key: str = ""
     backboard_llm_provider: str = "openrouter"
     backboard_model_name: str = "moonshotai/kimi-k2.6"
+    backboard_assistant_name: str = "Bench Preference Memory"
 
 
 @lru_cache

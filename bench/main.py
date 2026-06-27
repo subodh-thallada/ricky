@@ -8,6 +8,8 @@ from bench.schemas import (
     BenchRunPreviewResponse,
     BenchRunRequest,
     ConversationMessage,
+    FeatureDecisionRequest,
+    FeatureDecisionResponse,
     FeatureOptionsRequest,
     FeatureOptionsResponse,
     RoutedReplyResponse,
@@ -56,8 +58,30 @@ async def providers_check() -> dict[str, object]:
 @app.post("/feature-options", response_model=FeatureOptionsResponse)
 async def feature_options(request: FeatureOptionsRequest) -> FeatureOptionsResponse:
     settings = get_settings()
-    service = FeatureOptionsService(CerebrasClient(settings))
+    service = FeatureOptionsService(CerebrasClient(settings), BackboardAdapter(settings))
     return await service.generate(request)
+
+
+@app.post("/feature-options/decisions", response_model=FeatureDecisionResponse)
+async def remember_feature_decision(request: FeatureDecisionRequest) -> FeatureDecisionResponse:
+    settings = get_settings()
+    selected = next((option for option in request.options if option.id == request.selectedOptionId), None)
+    if selected is None:
+        raise HTTPException(status_code=400, detail="selected_option_not_found")
+
+    try:
+        result = await BackboardAdapter(settings).remember_decision(
+            feature_request=request.featureRequest,
+            selected_option=selected,
+            all_options=request.options,
+        )
+    except Exception as exc:  # pragma: no cover - external service surface
+        return FeatureDecisionResponse(status="error", error=str(exc))
+
+    return FeatureDecisionResponse(
+        status=str(result.get("status") or "ok"),
+        memoryId=result.get("memory_id") or result.get("id"),
+    )
 
 
 @app.post("/bench/preview", response_model=BenchRunPreviewResponse)

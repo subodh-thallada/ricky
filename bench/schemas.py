@@ -82,6 +82,8 @@ class FeatureOption(BaseModel):
     tradeoffs: list[str]
     generated_code: str = Field(alias="generatedCode")
     metrics: BenchMetricSet
+    recommended: bool = False
+    recommendation_reason: str | None = Field(default=None, alias="recommendationReason")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -191,6 +193,18 @@ class RoutedReplyResponse(BaseModel):
     context_summary: dict[str, object]
 
 
+class FeatureDecisionRequest(BaseModel):
+    featureRequest: str = Field(min_length=1)
+    selectedOptionId: str = Field(min_length=1)
+    options: list[FeatureOption]
+
+
+class FeatureDecisionResponse(BaseModel):
+    status: str
+    memoryId: str | None = None
+    error: str | None = None
+
+
 class FeatureOptionRequest(BaseModel):
     prompt: str = Field(min_length=1)
     language: str = "typescript"
@@ -217,6 +231,8 @@ class FeatureOption(BaseModel):
     tradeoffs: list[str] = Field(default_factory=list)
     generatedCode: str
     metrics: FeatureMetricSet
+    recommended: bool = False
+    recommendationReason: str | None = None
 
 
 class FeatureOptionResponse(BaseModel):

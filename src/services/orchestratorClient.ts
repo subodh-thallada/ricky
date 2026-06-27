@@ -11,8 +11,28 @@ export type FeatureOptionsResponse = {
 };
 
 export class OrchestratorClient {
+  async rememberFeatureDecision(featureRequest: string, selectedOptionId: string, options: BenchOption[]): Promise<void> {
+    const baseUrl = this.baseUrl();
+    const response = await fetch(`${baseUrl}/feature-options/decisions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        featureRequest,
+        selectedOptionId,
+        options: options.map(({ selected, applyState, applySummary, ...option }) => option)
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Bench memory save failed: ${response.status} ${errorText.slice(0, 280)}`);
+    }
+  }
+
   async generateFeatureOptions(prompt: string, workspaceContext: WorkspaceContext): Promise<{ message: string; options: BenchOption[]; contextSummary: string }> {
-    const baseUrl = vscode.workspace.getConfiguration("bench").get<string>("orchestratorUrl")?.replace(/\/$/, "") || "http://127.0.0.1:8000";
+    const baseUrl = this.baseUrl();
     const response = await fetch(`${baseUrl}/feature-options`, {
       method: "POST",
       headers: {
@@ -49,5 +69,9 @@ export class OrchestratorClient {
         applyState: "idle"
       }))
     };
+  }
+
+  private baseUrl(): string {
+    return vscode.workspace.getConfiguration("bench").get<string>("orchestratorUrl")?.replace(/\/$/, "") || "http://127.0.0.1:8000";
   }
 }

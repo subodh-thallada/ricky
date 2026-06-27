@@ -18,6 +18,8 @@ export type BenchMetricSet = {
 
 export type BenchOption = BenchSuggestion & {
   metrics: BenchMetricSet;
+  recommended?: boolean;
+  recommendationReason?: string;
   selected: boolean;
   applyState: "idle" | "previewed" | "applied";
   applySummary?: string;
@@ -31,6 +33,7 @@ export type ChatMessage = {
   appliedOptionId?: string;
   appliedOptionTitle?: string;
   appliedSummary?: string;
+  sourcePrompt?: string;
 };
 
 export type WorkspaceContext = {

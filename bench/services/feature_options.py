@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
 from bench.schemas import (
     BenchMetricSet,
@@ -16,8 +17,9 @@ from bench.services.repo_context import build_repo_context
 
 
 class FeatureOptionsService:
-    def __init__(self, cerebras: CerebrasClient):
+    def __init__(self, cerebras: CerebrasClient, backboard: BackboardAdapter | None = None):
         self.cerebras = cerebras
+        self.backboard = backboard
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
         prompt = _strip_provider_keywords(request.prompt)
@@ -30,9 +32,12 @@ class FeatureOptionsService:
         )
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
+        preference_memories = await self._search_preference_memories(prompt)
+        context_metadata["preference_memories_included"] = len(preference_memories)
 
         if not real_mode:
             suggestions = _parse_options(_build_test_response_text(prompt))
+            _apply_recommendation(suggestions, preference_memories)
             return FeatureOptionsResponse(
                 assistant_message=_build_assistant_message(len(suggestions)),
                 context_summary=context_summary,
@@ -94,6 +99,7 @@ class FeatureOptionsService:
                 ),
                 "preferFocusedSingleFile": True,
             },
+            "rememberedPreferenceSignals": _memory_texts(preference_memories),
         }
         response = await self.cerebras.chat(
             [
@@ -104,6 +110,7 @@ class FeatureOptionsService:
             temperature=0.35,
         )
         suggestions = _parse_options(response.text or "")
+        _apply_recommendation(suggestions, preference_memories)
         return FeatureOptionsResponse(
             assistant_message=_build_assistant_message(len(suggestions)),
             context_summary=context_summary,
@@ -112,6 +119,15 @@ class FeatureOptionsService:
             cerebras_model=response.model,
             options=[option.model_dump(by_alias=True) for option in suggestions],
         )
+
+    async def _search_preference_memories(self, prompt: str) -> list[dict[str, object]]:
+        if self.backboard is None:
+            return []
+        query = (
+            "Bench implementation preference for this feature request. "
+            f"Request: {prompt}"
+        )
+        return await self.backboard.search_decision_memories(query, limit=8)
 
 
 def _parse_options(content: str) -> list[FeatureOption]:
@@ -583,3 +599,92 @@ def _request_to_editor_context(request: FeatureOptionsRequest) -> EditorContext:
         visible_files=visible_files,
         symbol_name=None,
     )
+
+
+METRIC_KEYWORDS = {
+    "readability": ["readable", "clarity", "clear", "explicit", "understand", "idiom", "maintain"],
+    "simplicity": ["simple", "small", "minimal", "straightforward", "focused", "least"],
+    "speed": ["fast", "speed", "performance", "runtime", "parallel", "cache", "batch"],
+    "memory": ["memory", "space", "allocation", "stream", "efficient"],
+    "maintainability": ["maintain", "modular", "extensible", "separation", "service", "provider"],
+    "testConfidence": ["test", "confidence", "validated", "edge", "coverage", "safe"],
+}
+
+
+def _apply_recommendation(options: list[FeatureOption], memories: list[dict[str, object]]) -> None:
+    for option in options:
+        option.recommended = False
+        option.recommendationReason = None
+
+    if not options or not memories:
+        return
+
+    weights = _preference_weights(memories)
+    scored = [(option, _recommendation_score(option, weights, memories)) for option in options]
+    best_option, best_score = max(scored, key=lambda item: item[1])
+    if best_score <= 0:
+        return
+
+    best_option.recommended = True
+    top_metrics = sorted(weights.items(), key=lambda item: item[1], reverse=True)[:2]
+    if top_metrics:
+        labels = ", ".join(_metric_label(metric) for metric, _ in top_metrics)
+        best_option.recommendationReason = f"Recommended from prior accepted choices that emphasized {labels}."
+    else:
+        best_option.recommendationReason = "Recommended from similar previously accepted implementation choices."
+
+
+def _preference_weights(memories: list[dict[str, object]]) -> dict[str, float]:
+    weights = {metric: 0.0 for metric in METRIC_KEYWORDS}
+    for text in _memory_texts(memories):
+        lowered = text.lower()
+        for metric, keywords in METRIC_KEYWORDS.items():
+            weights[metric] += sum(1.0 for keyword in keywords if keyword in lowered)
+    return weights
+
+
+def _recommendation_score(
+    option: FeatureOption,
+    weights: dict[str, float],
+    memories: list[dict[str, object]],
+) -> float:
+    metrics = option.metrics.model_dump(by_alias=True)
+    metric_score = sum((metrics.get(metric, 0) / 100.0) * weight for metric, weight in weights.items())
+    option_text = f"{option.title} {option.summary} {option.implementationPlan} {' '.join(option.tradeoffs)}".lower()
+    keyword_score = 0.0
+    for metric, keywords in METRIC_KEYWORDS.items():
+        if weights.get(metric, 0) <= 0:
+            continue
+        keyword_score += sum(0.35 for keyword in keywords if keyword in option_text)
+
+    similarity_score = 0.0
+    option_tokens = _signal_tokens(option_text)
+    for memory_text in _memory_texts(memories):
+        memory_tokens = _signal_tokens(memory_text)
+        if option_tokens and memory_tokens:
+            similarity_score += len(option_tokens & memory_tokens) / max(1, len(option_tokens | memory_tokens))
+    return metric_score + keyword_score + similarity_score
+
+
+def _memory_texts(memories: list[dict[str, object]]) -> list[str]:
+    texts: list[str] = []
+    for memory in memories:
+        for key in ("content", "text", "memory"):
+            value = memory.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+                break
+    return texts
+
+
+def _signal_tokens(text: str) -> set[str]:
+    stopwords = {"the", "and", "for", "with", "that", "this", "option", "implementation", "choice", "chosen"}
+    return {
+        token
+        for token in re.findall(r"[a-z][a-z0-9]{3,}", text.lower())
+        if token not in stopwords
+    }
+
+
+def _metric_label(metric: str) -> str:
+    return "test confidence" if metric == "testConfidence" else metric

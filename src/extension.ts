@@ -38,7 +38,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Preview now loads directly into the editor as an inline draft."
+      content: "Describe the change you want to make. Bench will compare a few implementation paths and let you preview one in the editor before applying it."
     }
   ];
   private options: BenchOption[] = [];
@@ -103,7 +103,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.messages.push({ id: createId("user"), role: "user", content: prompt });
-    this.postState({ loading: true, notice: "Asking Gemini to plan, then Cerebras to write code..." });
+    this.postState({ loading: true, notice: "Drafting implementation options..." });
 
     try {
       const workspaceContext = getWorkspaceContext();
@@ -115,8 +115,9 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       this.messages.push({
         id: messageId,
         role: "assistant",
-        content: result.message || `I generated ${this.options.length} implementation options. Gemini supplied the chat, context, plans, and mock metrics; Cerebras wrote the code only.`,
-        options: cloneOptions(this.options)
+        content: result.message || `I found ${this.options.length} implementation options. Compare the tradeoffs, preview one in code, then apply the version you want to keep.`,
+        options: cloneOptions(this.options),
+        sourcePrompt: prompt
       });
       this.postState();
     } catch (error) {
@@ -127,7 +128,8 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         id: messageId,
         role: "assistant",
         content: `I could not reach the Bench orchestrator, so I loaded local demo options instead. ${formatError(error)}`,
-        options: cloneOptions(this.options)
+        options: cloneOptions(this.options),
+        sourcePrompt: prompt
       });
       this.postState({ error: formatError(error) });
     }
@@ -172,6 +174,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      void this.rememberDecision(messageId, optionId);
       this.finalizeAppliedMessage(messageId, optionId, result.summary);
       this.selectedOptionId = result.optionId;
       this.closeMessageDetailsPanels(messageId);
@@ -323,6 +326,36 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+
+  private async rememberDecision(messageId: string, optionId: string): Promise<void> {
+    const message = this.messages.find((item) => item.id === messageId);
+    if (!message?.options?.length) {
+      return;
+    }
+
+    const sourcePrompt = message.sourcePrompt ?? this.findNearestUserPrompt(messageId);
+    if (!sourcePrompt) {
+      return;
+    }
+
+    try {
+      await this.orchestrator.rememberFeatureDecision(sourcePrompt, optionId, message.options);
+    } catch (error) {
+      this.postState({ error: `Applied, but Bench could not save the preference memory. ${formatError(error)}` });
+    }
+  }
+
+  private findNearestUserPrompt(messageId: string): string | undefined {
+    const messageIndex = this.messages.findIndex((item) => item.id === messageId);
+    for (let index = messageIndex - 1; index >= 0; index -= 1) {
+      const candidate = this.messages[index];
+      if (candidate.role === "user") {
+        return candidate.content;
+      }
+    }
+    return undefined;
+  }
+
   private finalizeAppliedMessage(messageId: string, optionId: string, summary: string): void {
     this.messages = this.messages.map((message) => {
       if (message.id !== messageId || !message.options) {
@@ -364,41 +397,50 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     color-scheme: dark;
     --bg: var(--vscode-sideBar-background);
     --panel: var(--vscode-editor-background);
-    --card: var(--vscode-input-background);
-    --border: var(--vscode-panel-border);
+    --card: color-mix(in srgb, var(--vscode-sideBar-background) 72%, var(--vscode-editor-foreground) 4%);
+    --card-hover: color-mix(in srgb, var(--vscode-sideBar-background) 66%, var(--vscode-editor-foreground) 7%);
+    --border: color-mix(in srgb, var(--vscode-panel-border) 78%, transparent);
     --text: var(--vscode-foreground);
     --muted: var(--vscode-descriptionForeground);
-    --accent: #8b6bff;
-    --accent2: #19e3ff;
+    --accent: var(--vscode-focusBorder);
+    --accent-soft: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
+    --button: var(--vscode-button-background);
+    --button-hover: var(--vscode-button-hoverBackground);
     --good: #73c991;
     --warn: #cca700;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: var(--vscode-font-family); color: var(--text); background: var(--bg); }
+  body { margin: 0; font-family: var(--vscode-font-family); color: var(--text); background: var(--bg); font-size: 13px; }
   .app { height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
-  header { padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
-  .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; }
-  .bolt { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; color: #09090f; background: linear-gradient(120deg,var(--accent),var(--accent2)); }
-  .sub { margin-top: 4px; font-size: 12px; color: var(--muted); line-height: 1.35; }
-  main { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 10px; line-height: 1.45; }
-  .msg.user { background: color-mix(in srgb, var(--accent) 15%, var(--panel)); }
+  header { padding: 14px 16px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: .01em; }
+  .bolt { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; color: var(--vscode-badge-foreground); background: var(--vscode-badge-background); font-weight: 700; }
+  .sub { margin-top: 6px; font-size: 12px; color: var(--muted); line-height: 1.42; max-width: 58ch; }
+  main { overflow: auto; padding: 12px 12px 14px; display: flex; flex-direction: column; gap: 10px; scrollbar-gutter: stable; }
+  .msg { line-height: 1.45; color: var(--text); }
+  .msg.assistant { border-left: 2px solid var(--border); padding-left: 10px; color: color-mix(in srgb, var(--text) 86%, var(--muted)); }
+  .msg.user { align-self: flex-end; max-width: 92%; border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 9px 10px; }
   .msg.system { color: var(--muted); font-size: 12px; }
-  .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
-  .cards { display: flex; flex-direction: column; gap: 9px; margin-top: 10px; }
-  .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 10px; }
-  .card.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent2) 35%, transparent); }
+  .role { display: none; }
+  .cards { display: flex; flex-direction: column; gap: 8px; margin-top: 11px; }
+  .card { border: 1px solid var(--border); background: var(--card); border-radius: 7px; padding: 11px; transition: background .12s ease, border-color .12s ease; }
+  .card:hover { background: var(--card-hover); }
+  .card.selected { border-color: var(--accent); background: color-mix(in srgb, var(--card) 82%, var(--accent) 8%); }
+  .card.recommended { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   .cardTop { display: flex; justify-content: space-between; gap: 8px; align-items: start; }
-  .title { font-weight: 700; line-height: 1.25; }
-  .summary { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
-  .selectedBadge { font-size: 10px; color: #09090f; background: linear-gradient(120deg,var(--accent),var(--accent2)); border-radius: 999px; padding: 3px 7px; font-weight: 700; white-space: nowrap; }
-  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-  button { border: 1px solid var(--vscode-button-border, transparent); color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-radius: 6px; padding: 6px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+  .title { font-weight: 650; line-height: 1.28; }
+  .summary { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.42; }
+  .selectedBadge { font-size: 10px; color: var(--vscode-badge-foreground); background: var(--vscode-badge-background); border-radius: 999px; padding: 2px 7px; font-weight: 650; white-space: nowrap; }
+  .recommendation { margin-top: 8px; color: var(--text); font-size: 12px; line-height: 1.42; border-left: 2px solid var(--accent); padding-left: 8px; }
+  .actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 11px; }
+  button { border: 1px solid var(--vscode-button-border, transparent); color: var(--vscode-button-foreground); background: var(--button); border-radius: 5px; padding: 6px 10px; cursor: pointer; font: inherit; font-size: 12px; min-height: 28px; }
   button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
-  button:hover { background: var(--vscode-button-hoverBackground); }
+  button:hover { background: var(--button-hover); }
   button.secondary:hover { background: var(--vscode-list-hoverBackground); }
-  .composer { border-top: 1px solid var(--border); padding: 10px; display: grid; grid-template-columns: 1fr auto; gap: 8px; background: var(--panel); }
-  textarea { resize: none; min-height: 42px; max-height: 140px; border-radius: 8px; border: 1px solid var(--border); background: var(--vscode-input-background); color: var(--text); padding: 9px; font: inherit; }
+  button:disabled { opacity: .58; cursor: default; }
+  .composer { border-top: 1px solid var(--border); padding: 10px 12px 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; background: var(--panel); }
+  textarea { resize: none; min-height: 44px; max-height: 140px; border-radius: 7px; border: 1px solid var(--border); background: var(--vscode-input-background); color: var(--text); padding: 10px; font: inherit; line-height: 1.4; }
+  textarea:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
   .status { grid-column: 1 / -1; min-height: 18px; font-size: 12px; color: var(--muted); }
   .error { color: var(--vscode-errorForeground); }
   .empty { color: var(--muted); font-size: 12px; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; }
@@ -408,11 +450,11 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Gemini chats and scores. Cerebras writes code. Preview loads directly into the editor before you apply it.</div>
+      <div class="sub">Compare implementation paths, preview the best fit, and apply it when it reads right.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
-      <textarea id="input" placeholder="Ask Bench to build a feature..."></textarea>
+      <textarea id="input" placeholder="Describe a change..."></textarea>
       <button id="send" type="submit">Send</button>
       <div class="status" id="status"></div>
     </form>
@@ -453,7 +495,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     function render() {
       sendEl.disabled = Boolean(state.loading);
-      statusEl.textContent = state.loading ? 'Gemini planning, Cerebras writing code...' : (state.notice || '');
+      statusEl.textContent = state.loading ? 'Drafting implementation options...' : (state.notice || '');
       statusEl.className = state.error ? 'status error' : 'status';
       messagesEl.innerHTML = '';
 
@@ -481,7 +523,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       wrap.className = 'cards';
       for (const option of options) {
         const card = document.createElement('article');
-        card.className = 'card' + (option.selected ? ' selected' : '');
+        card.className = 'card' + (option.selected ? ' selected' : '') + (option.recommended ? ' recommended' : '');
         card.setAttribute('data-option-id', option.id);
         card.setAttribute('data-message-id', messageId);
         card.innerHTML = \`
@@ -489,14 +531,15 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
             <div>
               <div class="title">\${escapeHtml(option.title)}</div>
               <div class="summary">\${escapeHtml(option.summary)}</div>
+              \${option.recommended && option.recommendationReason ? '<div class="recommendation">' + escapeHtml(option.recommendationReason) + '</div>' : ''}
             </div>
-            \${option.applyState === 'applied' ? '<span class="selectedBadge">Applied</span>' : option.selected ? '<span class="selectedBadge">Preview Ready</span>' : ''}
+            \${option.applyState === 'applied' ? '<span class="selectedBadge">Applied</span>' : option.selected ? '<span class="selectedBadge">Preview Ready</span>' : option.recommended ? '<span class="selectedBadge">Recommended</span>' : ''}
           </div>
           \${option.applyState === 'applied'
             ? '<div class="summary">This implementation has been applied and locked in.</div>'
             : \`<div class="actions">
-                <button class="secondary" data-action="viewMetrics" type="button">View Details</button>
-                <button data-action="\${option.selected ? 'rejectSelected' : 'selectOption'}" type="button">\${option.selected ? 'Hide Preview' : 'Show in Code'}</button>
+                <button class="secondary" data-action="viewMetrics" type="button">Details</button>
+                <button data-action="\${option.selected ? 'rejectSelected' : 'selectOption'}" type="button">\${option.selected ? 'Close Preview' : 'Preview'}</button>
                 \${option.selected ? '<button data-action="applySelected" type="button">Accept</button>' : ''}
               </div>\`}\`;
         wrap.appendChild(card);
@@ -546,27 +589,32 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   :root {
     color-scheme: dark;
     --panel: var(--vscode-editor-background);
-    --card: var(--vscode-input-background);
-    --border: var(--vscode-panel-border);
+    --card: color-mix(in srgb, var(--vscode-sideBar-background) 72%, var(--vscode-editor-foreground) 4%);
+    --card-hover: color-mix(in srgb, var(--vscode-sideBar-background) 66%, var(--vscode-editor-foreground) 7%);
+    --border: color-mix(in srgb, var(--vscode-panel-border) 78%, transparent);
     --text: var(--vscode-foreground);
     --muted: var(--vscode-descriptionForeground);
-    --accent: #8b6bff;
-    --accent2: #19e3ff;
+    --accent: var(--vscode-focusBorder);
+    --accent-soft: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
+    --button: var(--vscode-button-background);
+    --button-hover: var(--vscode-button-hoverBackground);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 16px; font-family: var(--vscode-font-family); color: var(--text); background: var(--panel); }
-  h1 { font-size: 18px; line-height: 1.25; margin: 0; }
-  .summary { color: var(--muted); margin-top: 6px; line-height: 1.45; }
-  .tabs { display: flex; gap: 6px; margin: 16px 0; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
-  button { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
-  button.active { color: #09090f; border-color: transparent; background: linear-gradient(120deg,var(--accent),var(--accent2)); font-weight: 700; }
-  .panel { display: none; }
+  body { margin: 0; padding: 18px 22px; font-family: var(--vscode-font-family); color: var(--text); background: var(--panel); font-size: 13px; }
+  h1 { font-size: 20px; line-height: 1.25; margin: 0; font-weight: 650; max-width: 760px; }
+  .summary { color: var(--muted); margin-top: 9px; line-height: 1.5; max-width: 760px; }
+  .tabs { display: flex; gap: 6px; margin: 20px 0 18px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+  button { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 5px; padding: 7px 11px; cursor: pointer; font: inherit; min-height: 30px; }
+  button:hover { background: var(--vscode-list-hoverBackground); }
+  button.active { color: var(--vscode-button-foreground); border-color: var(--button); background: var(--button); font-weight: 650; }
+  .panel { display: none; max-width: 980px; }
   .panel.active { display: block; }
-  .metric { display: grid; grid-template-columns: 140px 1fr 44px; gap: 10px; align-items: center; margin: 12px 0; }
-  .bar { height: 10px; background: color-mix(in srgb, var(--muted) 18%, transparent); border-radius: 999px; overflow: hidden; }
-  .bar span { display: block; height: 100%; background: linear-gradient(90deg,var(--accent),var(--accent2)); }
-  .card { border: 1px solid var(--border); border-radius: 8px; background: var(--card); padding: 12px; margin: 12px 0; }
-  pre { white-space: pre-wrap; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--vscode-textCodeBlock-background); padding: 12px; line-height: 1.45; }
+  .metric { display: grid; grid-template-columns: minmax(120px, 170px) 1fr 38px; gap: 12px; align-items: center; margin: 12px 0; }
+  .metric strong { font-weight: 600; }
+  .bar { height: 8px; background: color-mix(in srgb, var(--muted) 18%, transparent); border-radius: 999px; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: var(--accent); }
+  .card { border: 1px solid var(--border); border-radius: 7px; background: var(--card); padding: 14px; margin: 12px 0; }
+  pre { white-space: pre-wrap; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--vscode-textCodeBlock-background); padding: 16px; line-height: 1.55; font-size: 13px; }
   ul { padding-left: 20px; }
   li { margin: 6px 0; }
 </style>
@@ -596,7 +644,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     document.getElementById('metrics').innerHTML = Object.entries(option.metrics).map(([key, value]) => {
       const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, (char) => char.toUpperCase());
       return '<div class="metric"><strong>' + escapeHtml(label) + '</strong><div class="bar"><span style="width:' + value + '%"></span></div><span>' + value + '</span></div>';
-    }).join('') + '<div class="card">Mock metric source: these values are placeholders for the future Docker sandbox runner.</div>';
+    }).join('') + '<div class="card">Metric values are provisional until connected to the sandbox runner.</div>';
 
     document.querySelector('.tabs').addEventListener('click', (event) => {
       if (!(event.target instanceof HTMLElement)) return;
