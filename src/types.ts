@@ -19,6 +19,8 @@ export type BenchMetricSet = {
 export type BenchOption = BenchSuggestion & {
   metrics: BenchMetricSet;
   selected: boolean;
+  applyState: "idle" | "previewed" | "applied";
+  applySummary?: string;
 };
 
 export type ChatMessage = {
@@ -26,6 +28,9 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   options?: BenchOption[];
+  appliedOptionId?: string;
+  appliedOptionTitle?: string;
+  appliedSummary?: string;
 };
 
 export type WorkspaceContext = {
@@ -43,6 +48,22 @@ export interface SandboxRunner {
   run(_options: BenchOption[]): Promise<BenchOption[]>;
 }
 
+export type ApplyPreviewResult = {
+  optionId: string;
+  fileCount: number;
+  summary: string;
+  deactivatedSessionIds?: string[];
+};
+
+export type ApplyResult = {
+  optionId: string;
+  fileCount: number;
+  summary: string;
+};
+
 export interface ApplyProvider {
-  select(option: BenchOption): Promise<void>;
+  preview(sessionId: string, option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult>;
+  applySelected(sessionId: string): Promise<ApplyResult | undefined>;
+  rejectSelected(sessionId: string): Promise<string | undefined>;
+  hasPendingSession(sessionId: string): boolean;
 }

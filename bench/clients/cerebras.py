@@ -89,7 +89,7 @@ def _maybe_build_test_response(
 ) -> TextGenerationResult | None:
     combined = "\n\n".join(message.get("content", "") for message in messages)
     lowered = combined.lower()
-    if "(test)" not in lowered:
+    if "(test)" not in lowered or "(real)" in lowered:
         return None
 
     if "fibonacci" in lowered and ("return exactly:" in lowered or "full function only" in lowered):

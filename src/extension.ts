@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { OrchestratorClient } from "./services/orchestratorClient";
-import { NoopSandboxRunner, SelectionOnlyApplyProvider } from "./services/placeholders";
+import { PreviewApplyProvider } from "./services/applyProvider";
+import { NoopSandboxRunner } from "./services/placeholders";
 import { BenchOption, ChatMessage, WorkspaceContext } from "./types";
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -29,18 +30,20 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "bench.chatView";
 
   private view?: vscode.WebviewView;
+  private readonly detailsPanels = new Map<string, vscode.WebviewPanel>();
   private readonly orchestrator = new OrchestratorClient();
   private readonly sandboxRunner = new NoopSandboxRunner();
-  private readonly applyProvider = new SelectionOnlyApplyProvider();
+  private readonly applyProvider = new PreviewApplyProvider();
   private messages: ChatMessage[] = [
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
+      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Preview now loads directly into the editor as an inline draft."
     }
   ];
   private options: BenchOption[] = [];
   private selectedOptionId?: string;
+  private activeOptionsMessageId?: string;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -61,13 +64,19 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
           await this.askFeature(message.text ?? "");
           break;
         case "viewMetrics":
-          this.showMetricsPanel(message.optionId, "metrics");
+          this.toggleDetailsPanel(message.messageId, message.optionId, "metrics");
           break;
         case "viewCode":
-          this.showMetricsPanel(message.optionId, "code");
+          this.toggleDetailsPanel(message.messageId, message.optionId, "code");
           break;
         case "selectOption":
-          await this.selectOption(message.optionId);
+          await this.selectOption(message.messageId, message.optionId);
+          break;
+        case "applySelected":
+          await this.applySelected(message.messageId, message.optionId);
+          break;
+        case "rejectSelected":
+          await this.rejectSelected(message.messageId, message.optionId);
           break;
       }
     });
@@ -83,6 +92,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     ];
     this.options = [];
     this.selectedOptionId = undefined;
+    this.activeOptionsMessageId = undefined;
     this.postState();
   }
 
@@ -100,48 +110,106 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       const result = await this.orchestrator.generateFeatureOptions(prompt, workspaceContext);
       this.options = await this.sandboxRunner.run(result.options);
       this.selectedOptionId = undefined;
+      const messageId = createId("assistant");
+      this.activeOptionsMessageId = messageId;
       this.messages.push({
-        id: createId("assistant"),
+        id: messageId,
         role: "assistant",
         content: result.message || `I generated ${this.options.length} implementation options. Gemini supplied the chat, context, plans, and mock metrics; Cerebras wrote the code only.`,
-        options: this.options
+        options: cloneOptions(this.options)
       });
       this.postState();
     } catch (error) {
       this.options = buildFallbackSuggestions(prompt);
+      const messageId = createId("assistant");
+      this.activeOptionsMessageId = messageId;
       this.messages.push({
-        id: createId("assistant"),
+        id: messageId,
         role: "assistant",
         content: `I could not reach the Bench orchestrator, so I loaded local demo options instead. ${formatError(error)}`,
-        options: this.options
+        options: cloneOptions(this.options)
       });
       this.postState({ error: formatError(error) });
     }
   }
 
-  private async selectOption(optionId?: string): Promise<void> {
-    const option = this.options.find((candidate) => candidate.id === optionId);
-    if (!option) {
+  private async selectOption(messageId?: string, optionId?: string): Promise<void> {
+    const option = this.findOption(messageId, optionId);
+    if (!option || !messageId || !optionId) {
       return;
     }
 
-    this.options = this.options.map((candidate) => ({
-      ...candidate,
-      selected: candidate.id === option.id
-    }));
-    this.selectedOptionId = option.id;
-    await this.applyProvider.select(option);
-    this.messages.push({
-      id: createId("system"),
-      role: "system",
-      content: `Selected "${option.title}". No files were changed.`
-    });
-    this.postState({ notice: `Selected ${option.title}. Workspace unchanged.` });
+    try {
+      const sessionId = buildSessionId(messageId, optionId);
+      const preview = await this.applyProvider.preview(sessionId, option, getWorkspaceContext());
+      this.applySessionState(messageId, optionId, "previewed", preview.summary);
+      for (const deactivatedSessionId of preview.deactivatedSessionIds ?? []) {
+        const parsed = parseSessionId(deactivatedSessionId);
+        if (parsed) {
+          this.applySessionState(parsed.messageId, parsed.optionId, "idle");
+        }
+      }
+      this.selectedOptionId = option.id;
+      void vscode.window.showInformationMessage(
+        `Preview loaded for "${option.title}". Review the inline draft in the editor, then apply or reject from the selected card.`
+      );
+      this.postState({ notice: preview.summary });
+    } catch (error) {
+      const errorMessage = `Bench could not preview "${option.title}". ${formatError(error)}`;
+      void vscode.window.showErrorMessage(errorMessage);
+      this.postState({ error: formatError(error) });
+    }
   }
 
-  private showMetricsPanel(optionId?: string, tab: "metrics" | "code" = "metrics"): void {
-    const option = this.options.find((candidate) => candidate.id === optionId);
-    if (!option) {
+  private async applySelected(messageId?: string, optionId?: string): Promise<void> {
+    if (!messageId || !optionId) {
+      return;
+    }
+    try {
+      await this.clearSiblingPreviews(messageId, optionId);
+      const result = await this.applyProvider.applySelected(buildSessionId(messageId, optionId));
+      if (!result) {
+        return;
+      }
+
+      this.finalizeAppliedMessage(messageId, optionId, result.summary);
+      this.selectedOptionId = result.optionId;
+      this.closeMessageDetailsPanels(messageId);
+      void vscode.window.showInformationMessage(result.summary);
+      this.postState({ notice: result.summary });
+    } catch (error) {
+      const errorMessage = formatError(error);
+      void vscode.window.showErrorMessage(errorMessage);
+      this.postState({ error: errorMessage });
+    }
+  }
+
+  private async rejectSelected(messageId?: string, optionId?: string): Promise<void> {
+    if (!messageId || !optionId) {
+      return;
+    }
+    const summary = await this.applyProvider.rejectSelected(buildSessionId(messageId, optionId));
+    if (!summary) {
+      return;
+    }
+
+    this.applySessionState(messageId, optionId, "idle");
+    this.closeOptionDetailsPanel(messageId, optionId);
+    this.selectedOptionId = undefined;
+    void vscode.window.showInformationMessage(summary);
+    this.postState({ notice: summary });
+  }
+
+  private toggleDetailsPanel(messageId?: string, optionId?: string, tab: "metrics" | "code" = "metrics"): void {
+    const option = this.findOption(messageId, optionId);
+    if (!option || !optionId || !messageId) {
+      return;
+    }
+
+    const panelKey = buildSessionId(messageId, optionId);
+    const existingPanel = this.detailsPanels.get(panelKey);
+    if (existingPanel) {
+      existingPanel.dispose();
       return;
     }
 
@@ -154,14 +222,18 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         retainContextWhenHidden: true
       }
     );
-
+    this.detailsPanels.set(panelKey, panel);
+    panel.onDidDispose(() => {
+      this.detailsPanels.delete(panelKey);
+    });
     panel.webview.html = this.getDetailsHtml(panel.webview, option, tab);
+    panel.reveal(vscode.ViewColumn.Beside, false);
   }
 
   private postState(extra: Partial<WebviewState> = {}): void {
     this.view?.webview.postMessage({
       type: "state",
-      state: {
+        state: {
         messages: this.messages,
         options: this.options,
         selectedOptionId: this.selectedOptionId,
@@ -169,6 +241,111 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         ...extra
       } satisfies WebviewState
     });
+  }
+
+  private syncActiveOptionsMessage(): void {
+    if (!this.activeOptionsMessageId) {
+      return;
+    }
+
+    this.messages = this.messages.map((message) => (
+      message.id === this.activeOptionsMessageId
+        ? { ...message, options: cloneOptions(this.options) }
+        : message
+    ));
+  }
+
+  private findOption(messageId?: string, optionId?: string): BenchOption | undefined {
+    if (!messageId || !optionId) {
+      return undefined;
+    }
+    const message = this.messages.find((item) => item.id === messageId);
+    return message?.options?.find((option) => option.id === optionId);
+  }
+
+  private applySessionState(
+    messageId: string,
+    optionId: string,
+    applyState: BenchOption["applyState"],
+    applySummary?: string
+  ): void {
+    this.messages = this.messages.map((message) => {
+      if (message.id !== messageId || !message.options) {
+        return message;
+      }
+      return {
+        ...message,
+        options: message.options.map((option) => (
+          option.id === optionId
+            ? { ...option, selected: applyState === "previewed" || applyState === "applied", applyState, applySummary }
+            : option
+        ))
+      };
+    });
+
+    if (this.activeOptionsMessageId === messageId) {
+      this.options = (this.messages.find((message) => message.id === messageId)?.options ?? []).map((option) => ({
+        ...option,
+        metrics: { ...option.metrics },
+        tradeoffs: [...option.tradeoffs]
+      }));
+    }
+  }
+
+  private closeOptionDetailsPanel(messageId: string, optionId: string): void {
+    this.detailsPanels.get(buildSessionId(messageId, optionId))?.dispose();
+  }
+
+  private closeMessageDetailsPanels(messageId: string): void {
+    for (const [panelKey, panel] of this.detailsPanels) {
+      if (panelKey.startsWith(`${messageId}::`)) {
+        panel.dispose();
+      }
+    }
+  }
+
+  private async clearSiblingPreviews(messageId: string, appliedOptionId: string): Promise<void> {
+    const message = this.messages.find((item) => item.id === messageId);
+    if (!message?.options) {
+      return;
+    }
+
+    for (const option of message.options) {
+      if (option.id === appliedOptionId) {
+        continue;
+      }
+      const sessionId = buildSessionId(messageId, option.id);
+      if (!this.applyProvider.hasPendingSession(sessionId)) {
+        continue;
+      }
+      await this.applyProvider.rejectSelected(sessionId);
+      this.applySessionState(messageId, option.id, "idle");
+    }
+  }
+
+  private finalizeAppliedMessage(messageId: string, optionId: string, summary: string): void {
+    this.messages = this.messages.map((message) => {
+      if (message.id !== messageId || !message.options) {
+        return message;
+      }
+
+      const appliedOption = message.options.find((option) => option.id === optionId);
+      if (!appliedOption) {
+        return message;
+      }
+
+      return {
+        ...message,
+        options: undefined,
+        appliedOptionId: appliedOption.id,
+        appliedOptionTitle: appliedOption.title,
+        appliedSummary: summary
+      };
+    });
+
+    if (this.activeOptionsMessageId === messageId) {
+      this.options = [];
+    }
   }
 
   private getChatHtml(webview: vscode.Webview): string {
@@ -215,11 +392,6 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   .title { font-weight: 700; line-height: 1.25; }
   .summary { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
   .selectedBadge { font-size: 10px; color: #09090f; background: linear-gradient(120deg,var(--accent),var(--accent2)); border-radius: 999px; padding: 3px 7px; font-weight: 700; white-space: nowrap; }
-  .miniMetrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
-  .metric { min-width: 0; }
-  .metric label { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; gap: 4px; }
-  .bar { height: 5px; background: color-mix(in srgb, var(--muted) 20%, transparent); border-radius: 999px; overflow: hidden; margin-top: 3px; }
-  .bar span { display: block; height: 100%; background: linear-gradient(90deg,var(--accent),var(--accent2)); border-radius: inherit; }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
   button { border: 1px solid var(--vscode-button-border, transparent); color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-radius: 6px; padding: 6px 9px; cursor: pointer; font: inherit; font-size: 12px; }
   button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
@@ -236,7 +408,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Gemini chats and scores. Cerebras writes code. Docker metrics come later.</div>
+      <div class="sub">Gemini chats and scores. Cerebras writes code. Preview loads directly into the editor before you apply it.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
@@ -271,10 +443,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     messagesEl.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
-      const optionId = target.closest('[data-option-id]')?.getAttribute('data-option-id');
+      const card = target.closest('[data-option-id]');
+      const optionId = card?.getAttribute('data-option-id');
+      const messageId = card?.getAttribute('data-message-id');
       const action = target.getAttribute('data-action');
       if (!optionId || !action) return;
-      vscode.postMessage({ type: action, optionId });
+      vscode.postMessage({ type: action, optionId, messageId });
     });
 
     function render() {
@@ -287,8 +461,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         const node = document.createElement('section');
         node.className = 'msg ' + message.role;
         node.innerHTML = '<div class="role">' + escapeHtml(message.role) + '</div><div>' + escapeHtml(message.content) + '</div>';
-        if (message.options?.length) {
-          node.appendChild(renderCards(message.options));
+        if (message.appliedOptionTitle) {
+          node.appendChild(renderAppliedMessage(message));
+        } else if (message.options?.length) {
+          node.appendChild(renderCards(message.id, message.options));
         }
         messagesEl.appendChild(node);
       }
@@ -300,38 +476,49 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    function renderCards(options) {
+    function renderCards(messageId, options) {
       const wrap = document.createElement('div');
       wrap.className = 'cards';
       for (const option of options) {
         const card = document.createElement('article');
         card.className = 'card' + (option.selected ? ' selected' : '');
         card.setAttribute('data-option-id', option.id);
+        card.setAttribute('data-message-id', messageId);
         card.innerHTML = \`
           <div class="cardTop">
             <div>
               <div class="title">\${escapeHtml(option.title)}</div>
               <div class="summary">\${escapeHtml(option.summary)}</div>
             </div>
-            \${option.selected ? '<span class="selectedBadge">Selected</span>' : ''}
+            \${option.applyState === 'applied' ? '<span class="selectedBadge">Applied</span>' : option.selected ? '<span class="selectedBadge">Preview Ready</span>' : ''}
           </div>
-          <div class="miniMetrics">
-            \${metric('Read', option.metrics.readability)}
-            \${metric('Speed', option.metrics.speed)}
-            \${metric('Tests', option.metrics.testConfidence)}
-          </div>
-          <div class="actions">
-            <button class="secondary" data-action="viewMetrics" type="button">View Metrics</button>
-            <button class="secondary" data-action="viewCode" type="button">View Code</button>
-            <button data-action="selectOption" type="button">\${option.selected ? 'Chosen' : 'Select'}</button>
-          </div>\`;
+          \${option.applyState === 'applied'
+            ? '<div class="summary">This implementation has been applied and locked in.</div>'
+            : \`<div class="actions">
+                <button class="secondary" data-action="viewMetrics" type="button">View Details</button>
+                <button data-action="\${option.selected ? 'rejectSelected' : 'selectOption'}" type="button">\${option.selected ? 'Hide Preview' : 'Show in Code'}</button>
+                \${option.selected ? '<button data-action="applySelected" type="button">Accept</button>' : ''}
+              </div>\`}\`;
         wrap.appendChild(card);
       }
       return wrap;
     }
 
-    function metric(label, value) {
-      return \`<div class="metric"><label><span>\${label}</span><span>\${value}</span></label><div class="bar"><span style="width:\${value}%"></span></div></div>\`;
+    function renderAppliedMessage(message) {
+      const wrap = document.createElement('div');
+      wrap.className = 'cards';
+      const card = document.createElement('article');
+      card.className = 'card selected';
+      card.innerHTML = \`
+        <div class="cardTop">
+          <div>
+            <div class="title">Applied: \${escapeHtml(message.appliedOptionTitle)}</div>
+            <div class="summary">\${escapeHtml(message.appliedSummary || 'This implementation has been applied and this option set is now locked.')}</div>
+          </div>
+          <span class="selectedBadge">Applied</span>
+        </div>\`;
+      wrap.appendChild(card);
+      return wrap;
     }
 
     function escapeHtml(value) {
@@ -433,9 +620,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 }
 
 type WebviewMessage = {
-  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption";
+  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption" | "applySelected" | "rejectSelected";
   text?: string;
   optionId?: string;
+  messageId?: string;
 };
 
 type WebviewState = {
@@ -482,7 +670,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 88,
         testConfidence: 76
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     },
     {
       id: `${slug}-modular`,
@@ -499,7 +688,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 94,
         testConfidence: 83
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     },
     {
       id: `${slug}-fast`,
@@ -516,9 +706,33 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 79,
         testConfidence: 71
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     }
   ];
+}
+
+function cloneOptions(options: BenchOption[]): BenchOption[] {
+  return options.map((option) => ({
+    ...option,
+    metrics: { ...option.metrics },
+    tradeoffs: [...option.tradeoffs]
+  }));
+}
+
+function buildSessionId(messageId: string, optionId: string): string {
+  return `${messageId}::${optionId}`;
+}
+
+function parseSessionId(sessionId: string): { messageId: string; optionId: string } | undefined {
+  const separatorIndex = sessionId.indexOf("::");
+  if (separatorIndex === -1) {
+    return undefined;
+  }
+  return {
+    messageId: sessionId.slice(0, separatorIndex),
+    optionId: sessionId.slice(separatorIndex + 2)
+  };
 }
 
 function createId(prefix: string): string {

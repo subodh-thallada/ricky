@@ -6,6 +6,21 @@
       "script": "compile",
       "group": "build",
       "problemMatcher": "$tsc"
+    },
+    {
+      "label": "reset demo workspace",
+      "type": "shell",
+      "command": "node ./scripts/reset-demo-workspace.mjs",
+      "problemMatcher": []
+    },
+    {
+      "label": "prepare demo run",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "npm: compile",
+        "reset demo workspace"
+      ],
+      "problemMatcher": []
     }
   ]
 }
