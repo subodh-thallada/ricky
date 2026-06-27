@@ -25,7 +25,8 @@ class ThreadChatService:
 
         repo_snapshot = ""
         context_summary: dict[str, object] = {
-            "conversation_messages": len(history),
+            "conversation_messages_stored": len(history),
+            "conversation_messages_sent": 0,
             "repo_context_included": False,
             "mode": mode,
         }
@@ -79,8 +80,6 @@ class ThreadChatService:
             )
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
-        messages.extend({"role": msg.role, "content": msg.content} for msg in history)
-
         user_content = prompt
         if repo_snapshot:
             user_content += f"\n\nRelevant repository context:\n{repo_snapshot}"
