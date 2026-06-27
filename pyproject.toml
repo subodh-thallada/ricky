@@ -1,0 +1,12 @@
+[project]
+name = "bench-local-mvp"
+version = "0.1.0"
+description = "Local Bench MVP daemon for isolated candidate runs."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+bench-daemon = "bench_daemon.cli:main"
