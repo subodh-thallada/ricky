@@ -21,6 +21,7 @@ class FeatureOptionsService:
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
         prompt = _strip_provider_keywords(request.prompt)
+        real_mode = _is_real_mode(request.prompt)
         inferred_context = infer_repo_context(
             prompt=prompt,
             root_path=request.repo_context.root_path if request.repo_context else ".",
@@ -30,15 +31,15 @@ class FeatureOptionsService:
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
 
-        if _should_use_test_options(request.prompt):
-            suggestions = _build_test_options(prompt)
+        if not real_mode:
+            suggestions = _parse_options(_build_test_response_text(prompt))
             return FeatureOptionsResponse(
                 assistant_message=_build_assistant_message(len(suggestions)),
                 context_summary=context_summary,
                 context_metadata=context_metadata,
                 gemini_model="local-context-only",
                 cerebras_model="cerebras-test-stub",
-                options=suggestions,
+                options=[option.model_dump(by_alias=True) for option in suggestions],
             )
 
         system_prompt = (
@@ -78,9 +79,9 @@ class FeatureOptionsService:
                 "activeFileName": request.active_file_name,
                 "languageId": request.language,
                 "selectedText": request.selected_text,
-                "visibleText": request.visible_text,
+                "visibleText": _sanitize_test_markers(request.visible_text) if real_mode else request.visible_text,
             },
-            "repositoryContext": repo_snapshot,
+            "repositoryContext": _sanitize_test_markers(repo_snapshot) if real_mode else repo_snapshot,
             "benchContext": {
                 "currentUi": {
                     "cards_show": ["title", "summary"],
@@ -109,7 +110,7 @@ class FeatureOptionsService:
             context_metadata=context_metadata,
             gemini_model="local-context-only",
             cerebras_model=response.model,
-            options=suggestions,
+            options=[option.model_dump(by_alias=True) for option in suggestions],
         )
 
 
@@ -140,7 +141,8 @@ def _parse_options(content: str) -> list[FeatureOption]:
                 ).model_dump(by_alias=True),
             }
         )
-        if option.title and option.generated_code:
+        generated_code = getattr(option, "generated_code", getattr(option, "generatedCode", ""))
+        if option.title and generated_code:
             options.append(option)
     if not options:
         raise ValueError("Cerebras returned no usable implementation options.")
@@ -188,16 +190,25 @@ def _build_assistant_message(option_count: int) -> str:
     )
 
 
-def _should_use_test_options(prompt: str) -> bool:
-    lowered = prompt.lower()
-    return "(test)" in lowered and "(real)" not in lowered
+def _is_real_mode(prompt: str) -> bool:
+    return "(real)" in prompt.lower()
 
 
 def _strip_provider_keywords(prompt: str) -> str:
     return prompt.replace("(REAL)", "").replace("(real)", "").replace("(TEST)", "").replace("(test)", "").strip()
 
 
-def _build_test_options(prompt: str) -> list[FeatureOption]:
+def _sanitize_test_markers(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.replace("(TEST)", "").replace("(test)", "")
+
+
+def _build_test_response_text(prompt: str) -> str:
+    return json.dumps({"suggestions": _build_test_suggestion_dicts(prompt)})
+
+
+def _build_test_suggestion_dicts(prompt: str) -> list[dict[str, object]]:
     lowered = prompt.lower()
     if "fibonacci" in lowered:
         raw = _fibonacci_test_options()
@@ -258,15 +269,7 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 ),
             },
         ]
-    return [
-        FeatureOption.model_validate(
-            {
-                **item,
-                "metrics": _build_metrics(item["title"], item["summary"], index).model_dump(by_alias=True),
-            }
-        )
-        for index, item in enumerate(raw)
-    ]
+    return raw
 
 
 def _fibonacci_test_options() -> list[dict[str, object]]:
