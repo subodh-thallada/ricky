@@ -23,20 +23,20 @@ class FeatureOptionsService:
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
         prompt = _strip_provider_keywords(request.prompt)
-        real_mode = _is_real_mode(request.prompt)
+        test_mode = _is_test_mode(request.prompt)
         inferred_context = infer_repo_context(
             prompt=prompt,
             root_path=request.repo_context.root_path if request.repo_context else ".",
             repo_context=request.repo_context,
             editor_context=_request_to_editor_context(request),
         )
-        if real_mode:
-            inferred_context = _expand_repo_context_for_real_mode(inferred_context)
+        if not test_mode:
+            inferred_context = _expand_repo_context_for_provider(inferred_context)
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
         recalled_memories = await self._recall_memories(request, prompt, context_metadata)
 
-        if not real_mode:
+        if test_mode:
             suggestions = _parse_options(_build_test_response_text(prompt))
             memory_result = await self._remember_feature_turn(request, prompt, suggestions, context_metadata)
             return FeatureOptionsResponse(
@@ -56,9 +56,9 @@ class FeatureOptionsService:
                 "activeFileName": request.active_file_name,
                 "languageId": request.language,
                 "selectedText": request.selected_text,
-                "visibleText": _sanitize_test_markers(request.visible_text) if real_mode else request.visible_text,
+                "visibleText": _sanitize_test_markers(request.visible_text),
             },
-            "repositoryContext": _sanitize_test_markers(repo_snapshot) if real_mode else repo_snapshot,
+            "repositoryContext": _sanitize_test_markers(repo_snapshot),
             "backboardMemory": recalled_memories,
             "benchContext": {
                 "currentUi": {
@@ -73,7 +73,7 @@ class FeatureOptionsService:
                 "preferMinimalFileSet": True,
             },
         }
-        response, suggestions = await self._generate_real_suggestions(user_payload)
+        response, suggestions = await self._generate_suggestions(user_payload)
         memory_result = await self._remember_feature_turn(request, prompt, suggestions, context_metadata)
         return FeatureOptionsResponse(
             assistant_message=_build_assistant_message(len(suggestions)),
@@ -130,32 +130,19 @@ class FeatureOptionsService:
             "assistant_id": result.get("assistant_id") or request.backboard_assistant_id,
         }
 
-    async def _generate_real_suggestions(
+    async def _generate_suggestions(
         self,
         user_payload: dict[str, object],
     ) -> tuple[object, list[FeatureOption]]:
         response = await self.cerebras.chat(
             [
-                {"role": "system", "content": _build_system_prompt(require_min_options=2, strict=False)},
+                {"role": "system", "content": _build_system_prompt()},
                 {"role": "user", "content": json.dumps(user_payload)},
             ],
             max_completion_tokens=2200,
             temperature=0.35,
         )
-        suggestions = _parse_options(response.text or "")
-        if len(suggestions) >= 2:
-            return response, suggestions
-
-        retry_response = await self.cerebras.chat(
-            [
-                {"role": "system", "content": _build_system_prompt(require_min_options=2, strict=True)},
-                {"role": "user", "content": json.dumps(user_payload)},
-            ],
-            max_completion_tokens=2600,
-            temperature=0.45,
-        )
-        retry_suggestions = _parse_options(retry_response.text or "")
-        return retry_response, retry_suggestions
+        return response, _parse_options(response.text or "")
 
 
 def _parse_options(content: str) -> list[FeatureOption]:
@@ -334,19 +321,13 @@ def _normalize_tradeoffs(value: object) -> list[str]:
     return []
 
 
-def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
-    option_requirement = (
-        f"Given a user's feature request and optional editor context, return at least {require_min_options} and at most 3 genuinely different implementation options.\n"
-    )
-    strict_requirement = (
-        "Do not return just 1 option. If the solution space is narrow, still provide at least 2 materially different correct implementations with clear tradeoffs.\n"
-        if strict
-        else "Prefer multiple options when they reflect real design choices the user may want to compare.\n"
-    )
+def _build_system_prompt() -> str:
     return (
         "You are Bench, a VS Code coding assistant.\n"
-        f"{option_requirement}"
-        f"{strict_requirement}"
+        "Return between 1 and 3 genuinely different implementation options. Never return more than 3.\n"
+        "Prefer 2 distinct, strong solutions when there are meaningful design tradeoffs a developer may want to compare.\n"
+        "Return 3 only when the third option adds another materially useful approach.\n"
+        "Return exactly 1 when one implementation is clearly strongest or additional options would be artificial, redundant, or weaker.\n"
         "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
         "Bench UI contract:\n"
         "- title: short and distinct.\n"
@@ -369,7 +350,7 @@ def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
         "- All options should be correct, but each should reflect a real design choice the user may want to compare.\n"
         "- Avoid returning trivial variants that only rename variables or reorder code.\n"
         "- Make the differences legible at the card-summary level and concrete in the plan/tradeoffs.\n"
-        "- Return at most 3 options.\n"
+        "- Quality and meaningful distinction matter more than filling every option slot.\n"
         "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
         'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
         '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
@@ -410,7 +391,7 @@ def _make_context_summary(metadata: dict[str, object]) -> str:
     return f"Using {files} summarized files via {strategy}. Cache hit: {cache_hit}."
 
 
-def _expand_repo_context_for_real_mode(config: RepoContextConfig) -> RepoContextConfig:
+def _expand_repo_context_for_provider(config: RepoContextConfig) -> RepoContextConfig:
     expanded = config.model_copy(deep=True)
     expanded.max_files = max(expanded.max_files, 28)
     expanded.max_file_chars = max(expanded.max_file_chars, 3500)
@@ -426,8 +407,8 @@ def _build_assistant_message(option_count: int) -> str:
     )
 
 
-def _is_real_mode(prompt: str) -> bool:
-    return "(real)" in prompt.lower()
+def _is_test_mode(prompt: str) -> bool:
+    return "(test)" in prompt.lower()
 
 
 def _strip_provider_keywords(prompt: str) -> str:

@@ -47,10 +47,10 @@ class FeatureOptionsTests(unittest.TestCase):
 
 
 class FeatureOptionsRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_real_prompt_uses_local_demo_without_calling_cerebras(self):
+    async def test_test_prompt_uses_local_demo_without_calling_cerebras(self):
         class FailingClient:
             async def chat(self, *args, **kwargs):
-                raise AssertionError("Cerebras must only run for an explicit (REAL) prompt")
+                raise AssertionError("Cerebras must not run for an explicit (test) prompt")
 
         with TemporaryDirectory() as tmpdir:
             Path(tmpdir, "students.py").write_text("def get_students():\n    pass\n", encoding="utf-8")
@@ -64,7 +64,7 @@ class FeatureOptionsRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.options), 3)
         self.assertTrue(all("### src/get_students_demo.py" in option.generated_code for option in response.options))
 
-    async def test_real_prompt_calls_cerebras_and_keeps_file_aware_output(self):
+    async def test_standard_prompt_calls_cerebras_and_keeps_file_aware_output(self):
         class FakeClient:
             calls = 0
 
@@ -79,7 +79,7 @@ class FeatureOptionsRoutingTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmpdir:
             response = await FeatureOptionsService(client).generate(
                 FeatureOptionsRequest(
-                    prompt="Implement the feature (REAL)",
+                    prompt="Implement the feature",
                     repo_context=RepoContextConfig(root_path=tmpdir),
                 )
             )
@@ -87,6 +87,30 @@ class FeatureOptionsRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, 1)
         self.assertEqual(len(response.options), 2)
         self.assertIn("### src/new_file.py", response.options[0].generated_code)
+
+    async def test_single_strong_provider_option_is_returned_without_retry(self):
+        class FakeClient:
+            calls = 0
+
+            async def chat(self, *args, **kwargs):
+                self.calls += 1
+                return SimpleNamespace(
+                    model="zai-glm-4.7",
+                    text='{"suggestions":[{"id":"focused","title":"Focused solution","summary":"The clear choice.","implementationPlan":"Implement the focused change.","tradeoffs":["No artificial variants"],"generatedCode":"def focused():\\n    return True\\n"}]}',
+                )
+
+        client = FakeClient()
+        with TemporaryDirectory() as tmpdir:
+            response = await FeatureOptionsService(client).generate(
+                FeatureOptionsRequest(
+                    prompt="Implement the clear-cut change",
+                    repo_context=RepoContextConfig(root_path=tmpdir),
+                )
+            )
+
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(len(response.options), 1)
+        self.assertEqual(response.options[0].id, "focused")
 
     def test_parse_options_recovers_complete_options_from_truncated_response(self):
         truncated = (

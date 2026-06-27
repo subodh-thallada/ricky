@@ -38,11 +38,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
+      content: "Tell me what feature you want to build. Bench will condense the relevant repository context and ask Cerebras for implementation options. Nothing is applied until you preview and accept a choice."
     }
   ];
   private options: BenchOption[] = [];
   private selectedOptionId?: string;
+  private activeOptionsMessageId?: string;
   private runState?: BenchRunState;
   private currentRunAbort?: AbortController;
   private lastPrompt = "";
@@ -69,13 +70,13 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
           await this.askFeature(message.text ?? "");
           break;
         case "selectOption":
-          await this.selectOption(message.optionId);
+          await this.selectOption(message.messageId, message.optionId);
           break;
         case "applySelected":
-          await this.applySelected(message.optionId);
+          await this.applySelected(message.messageId, message.optionId);
           break;
         case "rejectPreview":
-          await this.rejectPreview(message.optionId);
+          await this.rejectPreview(message.messageId, message.optionId);
           break;
         case "testAll":
           await this.testAll();
@@ -87,7 +88,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
           this.reset();
           break;
         case "viewLogs":
-          await this.fetchCandidateLogs(message.optionId, message.openInEditor);
+          await this.fetchCandidateLogs(message.messageId, message.optionId, message.openInEditor);
           break;
       }
     });
@@ -103,6 +104,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     ];
     this.options = [];
     this.selectedOptionId = undefined;
+    this.activeOptionsMessageId = undefined;
     this.runState = undefined;
     this.decisionLog = [];
     this.backboardThreadId = undefined;
@@ -121,7 +123,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     this.messages.push({ id: createId("user"), role: "user", content: prompt });
     this.lastPrompt = prompt;
     this.runState = undefined;
-    this.postState({ loading: true, notice: "Asking Gemini to plan, then Cerebras to write code..." });
+    this.postState({ loading: true, notice: "Condensing repository context and asking Cerebras for options..." });
 
     try {
       const workspaceContext = getWorkspaceContext();
@@ -134,8 +136,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       this.backboardAssistantId = result.backboardMemory.assistantId;
       this.options = result.options;
       this.selectedOptionId = undefined;
+      const messageId = createId("assistant");
+      this.activeOptionsMessageId = messageId;
       this.messages.push({
-        id: createId("assistant"),
+        id: messageId,
         role: "assistant",
         content: result.message || `I generated ${this.options.length} implementation options. Run them to populate measured metrics.`,
         options: this.options
@@ -143,8 +147,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       this.postState();
     } catch (error) {
       this.options = buildFastApiAuthFallbackSuggestions(prompt);
+      const messageId = createId("assistant");
+      this.activeOptionsMessageId = messageId;
       this.messages.push({
-        id: createId("assistant"),
+        id: messageId,
         role: "assistant",
         content: `I could not reach the Bench orchestrator, so I loaded local authenticated endpoint demo options that can still run through Docker. ${formatError(error)}`,
         options: this.options
@@ -271,41 +277,29 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (winner.applyState === "previewed") {
-      await this.applySelected(winner.id);
+      await this.applySelected(this.activeOptionsMessageId, winner.id);
       return;
     }
-    await this.selectOption(winner.id);
+    await this.selectOption(this.activeOptionsMessageId, winner.id);
   }
 
-  private async selectOption(optionId?: string): Promise<void> {
-    const option = this.options.find((candidate) => candidate.id === optionId);
-    if (!option) {
+  private async selectOption(messageId?: string, optionId?: string): Promise<void> {
+    const option = this.findOption(messageId, optionId);
+    if (!option || !messageId || !optionId) {
       return;
     }
 
     try {
-      const preview = await this.applyProvider.preview(option.id, option, getWorkspaceContext());
-      const deactivated = new Set(preview.deactivatedSessionIds ?? []);
-      this.options = this.options.map((candidate) => {
-        if (candidate.id === option.id) {
-          return {
-            ...candidate,
-            selected: true,
-            applyState: "previewed",
-            applySummary: preview.summary
-          };
+      const sessionId = buildSessionId(messageId, optionId);
+      const preview = await this.applyProvider.preview(sessionId, option, getWorkspaceContext());
+      this.applySessionState(messageId, optionId, "previewed", preview.summary);
+      for (const deactivatedSessionId of preview.deactivatedSessionIds ?? []) {
+        const deactivated = parseSessionId(deactivatedSessionId);
+        if (deactivated) {
+          this.applySessionState(deactivated.messageId, deactivated.optionId, "idle");
         }
-        if (deactivated.has(candidate.id) || candidate.applyState === "previewed") {
-          return {
-            ...candidate,
-            selected: false,
-            applyState: "idle",
-            applySummary: undefined
-          };
-        }
-        return { ...candidate, selected: false };
-      });
-      this.selectedOptionId = option.id;
+      }
+      this.selectedOptionId = sessionId;
       this.recordDecision(`User previewed "${option.title}". Summary: ${option.summary}`);
       this.syncMessageOptions();
       void vscode.window.showInformationMessage(`Preview loaded for "${option.title}". Review it in the editor before applying.`);
@@ -317,36 +311,24 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async applySelected(optionId?: string): Promise<void> {
-    const id = optionId ?? this.selectedOptionId;
-    const option = this.options.find((candidate) => candidate.id === id);
-    if (!option) {
+  private async applySelected(messageId?: string, optionId?: string): Promise<void> {
+    if (!messageId || !optionId) {
       return;
     }
+    const option = this.findOption(messageId, optionId);
+    if (!option) return;
 
     try {
-      const result = await this.applyProvider.applySelected(option.id);
+      const sessionId = buildSessionId(messageId, optionId);
+      await this.clearSiblingPreviews(messageId, optionId);
+      const result = await this.applyProvider.applySelected(sessionId);
       if (!result) {
-        await this.selectOption(option.id);
+        await this.selectOption(messageId, optionId);
         return;
       }
 
-      this.options = this.options.map((candidate) => (
-        candidate.id === option.id
-          ? {
-              ...candidate,
-              selected: true,
-              applyState: "applied",
-              applySummary: result.summary
-            }
-          : {
-              ...candidate,
-              selected: false,
-              applyState: candidate.applyState === "previewed" ? "idle" : candidate.applyState,
-              applySummary: candidate.applyState === "previewed" ? undefined : candidate.applySummary
-            }
-      ));
-      this.selectedOptionId = option.id;
+      this.finalizeAppliedMessage(messageId, optionId, result.summary);
+      this.selectedOptionId = sessionId;
       this.recordDecision(`User applied "${option.title}". ${result.summary}`);
       this.syncMessageOptions();
       void vscode.window.showInformationMessage(result.summary);
@@ -358,25 +340,16 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async rejectPreview(optionId?: string): Promise<void> {
-    const id = optionId ?? this.selectedOptionId;
-    const option = this.options.find((candidate) => candidate.id === id);
-    if (!option) {
+  private async rejectPreview(messageId?: string, optionId?: string): Promise<void> {
+    const option = this.findOption(messageId, optionId);
+    if (!option || !messageId || !optionId) {
       return;
     }
 
-    const summary = await this.applyProvider.rejectSelected(option.id);
-    this.options = this.options.map((candidate) => (
-      candidate.id === option.id
-        ? {
-            ...candidate,
-            selected: false,
-            applyState: "idle",
-            applySummary: undefined
-          }
-        : candidate
-    ));
-    if (this.selectedOptionId === option.id) {
+    const sessionId = buildSessionId(messageId, optionId);
+    const summary = await this.applyProvider.rejectSelected(sessionId);
+    this.applySessionState(messageId, optionId, "idle");
+    if (this.selectedOptionId === sessionId) {
       this.selectedOptionId = undefined;
     }
     this.syncMessageOptions();
@@ -475,9 +448,9 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       : this.sandboxRunner.runPythonMerge(options, callbacks, signal);
   }
 
-  private async fetchCandidateLogs(optionId?: string, openInEditor?: boolean): Promise<void> {
-    const option = this.options.find((candidate) => candidate.id === optionId);
-    if (!option) {
+  private async fetchCandidateLogs(messageId?: string, optionId?: string, openInEditor?: boolean): Promise<void> {
+    const option = this.findOption(messageId, optionId);
+    if (!option || !messageId) {
       return;
     }
 
@@ -488,6 +461,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       }
       this.view?.webview.postMessage({
         type: "logs",
+        messageId,
         optionId: option.id,
         status: option.runStatus,
         notice: "No Docker logs yet — run Test all first."
@@ -507,6 +481,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       }
       this.view?.webview.postMessage({
         type: "logs",
+        messageId,
         optionId: option.id,
         status: option.runStatus,
         content
@@ -519,6 +494,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       }
       this.view?.webview.postMessage({
         type: "logs",
+        messageId,
         optionId: option.id,
         status: option.runStatus,
         error: message
@@ -527,14 +503,78 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private syncMessageOptions(): void {
-    let replaced = false;
-    this.messages = [...this.messages].reverse().map((message) => {
-      if (!replaced && message.options) {
-        replaced = true;
-        return { ...message, options: this.options };
-      }
-      return message;
-    }).reverse();
+    if (!this.activeOptionsMessageId) return;
+    this.messages = this.messages.map((message) => (
+      message.id === this.activeOptionsMessageId && message.options
+        ? { ...message, options: cloneOptions(this.options) }
+        : message
+    ));
+  }
+
+  private findOption(messageId?: string, optionId?: string): BenchOption | undefined {
+    if (!messageId || !optionId) return undefined;
+    return this.messages
+      .find((message) => message.id === messageId)
+      ?.options?.find((option) => option.id === optionId);
+  }
+
+  private applySessionState(
+    messageId: string,
+    optionId: string,
+    applyState: BenchOption["applyState"],
+    applySummary?: string
+  ): void {
+    this.messages = this.messages.map((message) => {
+      if (message.id !== messageId || !message.options) return message;
+      return {
+        ...message,
+        options: message.options.map((option) => (
+          option.id === optionId
+            ? {
+                ...option,
+                selected: applyState === "previewed" || applyState === "applied",
+                applyState,
+                applySummary
+              }
+            : option
+        ))
+      };
+    });
+
+    if (this.activeOptionsMessageId === messageId) {
+      this.options = cloneOptions(this.messages.find((message) => message.id === messageId)?.options ?? []);
+    }
+  }
+
+  private async clearSiblingPreviews(messageId: string, selectedOptionId: string): Promise<void> {
+    const message = this.messages.find((item) => item.id === messageId);
+    for (const option of message?.options ?? []) {
+      if (option.id === selectedOptionId) continue;
+      const sessionId = buildSessionId(messageId, option.id);
+      if (!this.applyProvider.hasPendingSession(sessionId)) continue;
+      await this.applyProvider.rejectSelected(sessionId);
+      this.applySessionState(messageId, option.id, "idle");
+    }
+  }
+
+  private finalizeAppliedMessage(messageId: string, optionId: string, summary: string): void {
+    this.messages = this.messages.map((message) => {
+      if (message.id !== messageId || !message.options) return message;
+      const applied = message.options.find((option) => option.id === optionId);
+      if (!applied) return message;
+      return {
+        ...message,
+        options: undefined,
+        appliedOptionId: applied.id,
+        appliedOptionTitle: applied.title,
+        appliedSummary: summary
+      };
+    });
+
+    if (this.activeOptionsMessageId === messageId) {
+      this.options = [];
+      this.runState = undefined;
+    }
   }
 
   private getChatHtml(webview: vscode.Webview): string {
@@ -1219,6 +1259,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     let state = normalizeState({ messages: [], options: [], loading: false });
     let logsPanel = {
+      messageId: undefined,
       optionId: undefined,
       optionIndex: 0,
       activeTab: 'logs',
@@ -1266,21 +1307,23 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       if (!actionNode) actionNode = target;
 
       const action = actionNode.getAttribute('data-action');
-      const optionId = target.closest('[data-option-id]')?.getAttribute('data-option-id') || logsPanel.optionId;
+      const cardNode = target.closest('[data-option-id]');
+      const optionId = cardNode?.getAttribute('data-option-id') || logsPanel.optionId;
+      const messageId = cardNode?.getAttribute('data-message-id') || logsPanel.messageId;
       const tab = actionNode.getAttribute('data-tab');
 
       if (action === 'newChat') {
         closeLogsPanel();
         vscode.postMessage({ type: 'newFeatureChat' });
       }
-      else if (action === 'viewLogs' && optionId) {
-        openLogsPanel(optionId);
+      else if (action === 'viewLogs' && messageId && optionId) {
+        openLogsPanel(messageId, optionId);
       }
       else if (action === 'closeLogs') {
         closeLogsPanel();
       }
       else if (action === 'openLogsInEditor' && logsPanel.optionId) {
-        vscode.postMessage({ type: 'viewLogs', optionId: logsPanel.optionId, openInEditor: true });
+        vscode.postMessage({ type: 'viewLogs', messageId: logsPanel.messageId, optionId: logsPanel.optionId, openInEditor: true });
       }
       else if (action === 'clearLogs') {
         clearLogsContent();
@@ -1291,7 +1334,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       else if (tab) {
         setLogsTab(tab);
       }
-      else if (action && optionId) vscode.postMessage({ type: action, optionId });
+      else if (action && messageId && optionId) vscode.postMessage({ type: action, messageId, optionId });
       else if (action) vscode.postMessage({ type: action });
     });
 
@@ -1340,6 +1383,9 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       if (Array.isArray(source.options)) {
         message.options = source.options.map(normalizeOption).filter(Boolean);
       }
+      message.appliedOptionId = textOrUndefined(source.appliedOptionId);
+      message.appliedOptionTitle = textOrUndefined(source.appliedOptionTitle);
+      message.appliedSummary = textOrUndefined(source.appliedSummary);
       return message;
     }
 
@@ -1431,8 +1477,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
             content.appendChild(dot);
             content.appendChild(text);
             node.appendChild(content);
-            if (Array.isArray(message.options) && message.options.length) {
-              node.appendChild(renderCards(message.options));
+            if (message.appliedOptionTitle) {
+              node.appendChild(renderAppliedDecision(message));
+            } else if (Array.isArray(message.options) && message.options.length) {
+              node.appendChild(renderCards(message.id, message.options));
             }
           }
           nextMessages.appendChild(node);
@@ -1475,7 +1523,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       \`;
     }
 
-    function renderCards(options) {
+    function renderCards(messageId, options) {
       const wrap = document.createElement('div');
       wrap.className = 'cards';
       options.forEach((option, index) => {
@@ -1493,6 +1541,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         const card = document.createElement('div');
         card.className = 'card ' + status + (option.selected ? ' selected' : '');
         card.setAttribute('data-option-id', String(option.id || ''));
+        card.setAttribute('data-message-id', String(messageId || ''));
 
         const top = document.createElement('div');
         top.className = 'card-top';
@@ -1571,6 +1620,23 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         }
         wrap.appendChild(card);
       });
+      return wrap;
+    }
+
+    function renderAppliedDecision(message) {
+      const wrap = document.createElement('div');
+      wrap.className = 'cards';
+      const card = document.createElement('div');
+      card.className = 'card passed selected';
+      const title = document.createElement('div');
+      title.className = 'card-title';
+      title.textContent = 'Applied: ' + String(message.appliedOptionTitle || 'implementation');
+      const summary = document.createElement('div');
+      summary.className = 'card-summary';
+      summary.textContent = String(message.appliedSummary || 'This decision has been applied and locked.');
+      card.appendChild(title);
+      card.appendChild(summary);
+      wrap.appendChild(card);
       return wrap;
     }
 
@@ -1704,31 +1770,25 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       return issues;
     }
 
-    function findOptionContext(optionId) {
-      const allOptions = [];
-      for (const message of state.messages || []) {
-        if (Array.isArray(message.options)) {
-          allOptions.push(...message.options);
-        }
-      }
-      if (!allOptions.length && Array.isArray(state.options)) {
-        allOptions.push(...state.options);
-      }
-      const index = allOptions.findIndex((option) => option.id === optionId);
+    function findOptionContext(messageId, optionId) {
+      const message = (state.messages || []).find((item) => item.id === messageId);
+      const options = Array.isArray(message?.options) ? message.options : [];
+      const index = options.findIndex((option) => option.id === optionId);
       if (index < 0) {
         return undefined;
       }
-      return { option: allOptions[index], index };
+      return { option: options[index], index };
     }
 
-    function openLogsPanel(optionId) {
-      const context = findOptionContext(optionId);
+    function openLogsPanel(messageId, optionId) {
+      const context = findOptionContext(messageId, optionId);
       if (!context) {
         return;
       }
       const status = String(context.option.runStatus || 'draft');
       const isFailedStatus = status === 'failed' || status === 'error' || status === 'timeout';
       logsPanel = {
+        messageId,
         optionId,
         optionIndex: context.index,
         activeTab: isFailedStatus ? 'logs' : 'details',
@@ -1741,13 +1801,14 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       setLogsTab(logsPanel.activeTab);
       refreshLogsPanelContent();
       renderLogsContent('Loading Docker logs...', 'system');
-      vscode.postMessage({ type: 'viewLogs', optionId });
+      vscode.postMessage({ type: 'viewLogs', messageId, optionId });
     }
 
     function closeLogsPanel() {
       logsOverlayEl.classList.remove('open');
       logsOverlayEl.setAttribute('aria-hidden', 'true');
       logsPanel = {
+        messageId: undefined,
         optionId: undefined,
         optionIndex: 0,
         activeTab: 'logs',
@@ -1769,7 +1830,9 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function refreshLogsPanelContent() {
-      const context = logsPanel.optionId ? findOptionContext(logsPanel.optionId) : undefined;
+      const context = logsPanel.messageId && logsPanel.optionId
+        ? findOptionContext(logsPanel.messageId, logsPanel.optionId)
+        : undefined;
       if (!context) {
         return;
       }
@@ -1786,7 +1849,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function handleLogsMessage(data) {
-      if (!logsPanel.optionId || data.optionId !== logsPanel.optionId) {
+      if (!logsPanel.optionId || data.optionId !== logsPanel.optionId || data.messageId !== logsPanel.messageId) {
         return;
       }
       logsPanel.loading = false;
@@ -1890,6 +1953,7 @@ type WebviewMessage = {
     | "viewLogs";
   text?: string;
   optionId?: string;
+  messageId?: string;
   openInEditor?: boolean;
 };
 
@@ -2198,6 +2262,36 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
       selected: false
     }
   ];
+}
+
+function cloneOptions(options: BenchOption[]): BenchOption[] {
+  return options.map((option) => ({
+    ...option,
+    metrics: option.metrics ? { ...option.metrics } : option.metrics,
+    measured: option.measured
+      ? {
+          ...option.measured,
+          tests: option.measured.tests ? { ...option.measured.tests } : option.measured.tests,
+          failures: option.measured.failures?.map((failure) => ({ ...failure })),
+          errors: option.measured.errors?.map((error) => ({ ...error })),
+          metrics: option.measured.metrics ? { ...option.measured.metrics } : option.measured.metrics
+        }
+      : undefined,
+    tradeoffs: [...option.tradeoffs]
+  }));
+}
+
+function buildSessionId(messageId: string, optionId: string): string {
+  return `${messageId}::${optionId}`;
+}
+
+function parseSessionId(sessionId: string): { messageId: string; optionId: string } | undefined {
+  const separatorIndex = sessionId.indexOf("::");
+  if (separatorIndex < 1) return undefined;
+  return {
+    messageId: sessionId.slice(0, separatorIndex),
+    optionId: sessionId.slice(separatorIndex + 2)
+  };
 }
 
 function createId(prefix: string): string {
