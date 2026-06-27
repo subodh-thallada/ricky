@@ -1,0 +1,7 @@
+node_modules/**
+src/**
+.gitignore
+tsconfig.json
+demo.html
+bench-product-spec.md
+**/*.map
