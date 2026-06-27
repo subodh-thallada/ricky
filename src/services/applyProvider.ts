@@ -196,11 +196,13 @@ export class PreviewApplyProvider implements ApplyProvider {
         : undefined,
       code
     );
+    const trimmedCode = normalizeGeneratedCodeForPlacement(trimTrailingWhitespace(code), document.languageId);
     const proposedContent = replaceSelection(
       originalContent,
       placement.startOffset,
       placement.endOffset,
-      code
+      trimmedCode,
+      document.languageId
     );
 
     return [
@@ -211,7 +213,7 @@ export class PreviewApplyProvider implements ApplyProvider {
         originalContent,
         proposedContent,
         previewStartOffset: placement.startOffset,
-        previewEndOffset: placement.startOffset + trimTrailingWhitespace(code).length
+        previewEndOffset: placement.startOffset + trimmedCode.length
       }
     ];
   }
@@ -288,7 +290,7 @@ function buildProposedArtifactState(
   code: string,
   languageId?: string
 ): Pick<PendingArtifact, "originalContent" | "proposedContent" | "previewStartOffset" | "previewEndOffset"> {
-  const trimmedCode = trimTrailingWhitespace(code);
+  const trimmedCode = normalizeGeneratedCodeForPlacement(trimTrailingWhitespace(code), languageId ?? inferLanguageFromCode(code) ?? "");
   if (!originalContent) {
     return {
       originalContent,
@@ -310,7 +312,13 @@ function buildProposedArtifactState(
   const placement = inferPlacementRange(originalContent, languageId ?? inferLanguageFromCode(code) ?? "", undefined, trimmedCode);
   return {
     originalContent,
-    proposedContent: replaceSelection(originalContent, placement.startOffset, placement.endOffset, trimmedCode),
+    proposedContent: replaceSelection(
+      originalContent,
+      placement.startOffset,
+      placement.endOffset,
+      trimmedCode,
+      languageId ?? inferLanguageFromCode(code) ?? ""
+    ),
     previewStartOffset: placement.startOffset,
     previewEndOffset: placement.startOffset + trimmedCode.length
   };
@@ -496,8 +504,37 @@ function clearPreviewDecorations(document: vscode.TextDocument): void {
   editor?.setDecorations(previewDecoration, []);
 }
 
-function replaceSelection(source: string, start: number, end: number, code: string): string {
-  return `${source.slice(0, start)}${trimTrailingWhitespace(code)}${source.slice(end)}`;
+function replaceSelection(source: string, start: number, end: number, code: string, languageId?: string): string {
+  const before = source.slice(0, start);
+  const after = source.slice(end);
+  const normalizedCode = normalizeGeneratedCodeForPlacement(trimTrailingWhitespace(code), languageId);
+  return `${before}${withPythonTopLevelBoundaries(before, normalizedCode, after, languageId)}${after}`;
+}
+
+function normalizeGeneratedCodeForPlacement(code: string, languageId?: string): string {
+  if (languageId !== "python") {
+    return code;
+  }
+  return code.replace(/([)\]}])(?=(?:def|class)\s+[A-Za-z_][A-Za-z0-9_]*\b)/g, "$1\n\n");
+}
+
+function withPythonTopLevelBoundaries(before: string, code: string, after: string, languageId?: string): string {
+  if (languageId !== "python") {
+    return code;
+  }
+
+  let bounded = code;
+  if (before && !before.endsWith("\n") && startsWithPythonTopLevelSymbol(bounded)) {
+    bounded = `\n\n${bounded}`;
+  }
+  if (after && startsWithPythonTopLevelSymbol(after) && !bounded.endsWith("\n")) {
+    bounded = `${bounded}\n\n`;
+  }
+  return bounded;
+}
+
+function startsWithPythonTopLevelSymbol(value: string): boolean {
+  return /^(?:def|class)\s+[A-Za-z_][A-Za-z0-9_]*\b/.test(value.replace(/^\s+/, ""));
 }
 
 function trimTrailingWhitespace(value: string): string {
