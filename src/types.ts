@@ -17,11 +17,46 @@ export type BenchMetricSet = {
 };
 
 export type BenchOption = BenchSuggestion & {
-  metrics: BenchMetricSet;
+  metrics?: BenchMetricSet | null;
+  candidateId?: string;
+  runId?: string;
+  runStatus: CandidateRunStatus;
+  measured?: CandidateMeasurement;
+  logsUrl?: string;
+  codeUrl?: string;
   selected: boolean;
-  applyState: "idle" | "previewed" | "applied";
+  applyState?: "idle" | "previewed" | "applied";
   applySummary?: string;
 };
+
+export type CandidateRunStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "passed"
+  | "failed"
+  | "timeout"
+  | "error";
+
+export type CandidateMeasurement = {
+  status: "passed" | "failed" | "timeout" | "error";
+  exitCode?: number | null;
+  durationMs?: number | null;
+  tests?: { passed: number; failed: number; total: number } | null;
+  failures?: Array<{ test?: string; details?: string }>;
+  errors?: Array<Record<string, unknown>>;
+  metrics?: Record<string, unknown>;
+};
+
+export type BenchRunState = {
+  runId: string;
+  fixtureId: BenchFixtureId;
+  status: "queued" | "running" | "completed" | "failed";
+  winnerCandidateId?: string | null;
+  summary?: string | null;
+};
+
+export type BenchFixtureId = "python-merge" | "fastapi-auth-endpoint";
 
 export type ChatMessage = {
   id: string;

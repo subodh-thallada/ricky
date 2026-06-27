@@ -1,13 +1,14 @@
 import * as vscode from "vscode";
-import { BenchOption, WorkspaceContext } from "../types";
+import { BenchMetricSet, BenchOption, CandidateMeasurement, CandidateRunStatus, WorkspaceContext } from "../types";
+import { ensureLocalService } from "./localServiceManager";
 
 export type FeatureOptionsResponse = {
-  assistantMessage: string;
-  contextSummary: string;
-  contextMetadata: Record<string, unknown>;
-  geminiModel: string;
-  cerebrasModel: string;
-  options: Array<Omit<BenchOption, "selected" | "applyState" | "applySummary">>;
+  assistantMessage?: unknown;
+  contextSummary?: unknown;
+  contextMetadata?: unknown;
+  geminiModel?: unknown;
+  cerebrasModel?: unknown;
+  options?: unknown[];
 };
 
 export class OrchestratorClient {
@@ -17,14 +18,36 @@ export class OrchestratorClient {
     const activeRelativePath = workspaceContext.activeFileName && workspaceRoot
       ? vscode.workspace.asRelativePath(workspaceContext.activeFileName, false)
       : undefined;
+    await ensureLocalService({
+      label: "Bench orchestrator",
+      baseUrl,
+      command: ".venv/bin/uvicorn",
+      args: ["bench.main:app", "--host", "127.0.0.1", "--port", "8000"],
+      logFile: ".bench-logs/orchestrator.log"
+    });
+    const endpointRequest = isAuthenticatedEndpointRequest(prompt);
+    const modelPrompt = endpointRequest
+      ? [
+          prompt,
+          "",
+          "Bench runnable fixture contract for this endpoint request:",
+          "Return Python FastAPI implementations only.",
+          "Each generatedCode value must be the complete contents of candidate_target.py.",
+          "Each candidate must define create_app() that returns a FastAPI app.",
+          "The app must expose GET /health and GET /protected.",
+          "GET /protected must require Authorization: Bearer test-token.",
+          "Missing auth must return 401; wrong bearer token must return 403; valid token must return 200 JSON.",
+          "Do not include Markdown fences."
+        ].join("\n")
+      : prompt;
     const response = await fetch(`${baseUrl}/feature-options`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        prompt,
-        language: workspaceContext.languageId || "typescript",
+        prompt: modelPrompt,
+        language: endpointRequest ? "python" : workspaceContext.languageId ?? "typescript",
         active_file_name: workspaceContext.activeFileName,
         selected_text: workspaceContext.selectedText,
         visible_text: workspaceContext.visibleText,
@@ -43,15 +66,84 @@ export class OrchestratorClient {
       throw new Error(`Bench orchestrator failed: ${response.status} ${errorText.slice(0, 280)}`);
     }
 
-    const payload = await response.json() as FeatureOptionsResponse;
+    const payload = await response.json() as Partial<FeatureOptionsResponse>;
+    const rawOptions = Array.isArray(payload.options) ? payload.options : [];
     return {
-      message: payload.assistantMessage,
-      contextSummary: payload.contextSummary,
-      options: payload.options.map((option) => ({
-        ...option,
-        selected: false,
-        applyState: "idle"
-      }))
+      message: textField(payload.assistantMessage),
+      contextSummary: textField(payload.contextSummary),
+      options: rawOptions.map(normalizeOption)
     };
   }
+}
+
+function isAuthenticatedEndpointRequest(prompt: string): boolean {
+  return /auth|authenticated|authorization|bearer|token|endpoint|route|api/i.test(prompt);
+}
+
+function normalizeOption(raw: unknown, index: number): BenchOption {
+  const source = isRecord(raw) ? raw : {};
+  const metrics = isRecord(source.metrics) ? normalizeMetrics(source.metrics) : undefined;
+  return {
+    id: textField(source.id) || `option-${index + 1}`,
+    title: textField(source.title) || `Option ${index + 1}`,
+    summary: textField(source.summary),
+    implementationPlan: textField(source.implementationPlan) || textField(source.implementation_plan),
+    tradeoffs: Array.isArray(source.tradeoffs) ? source.tradeoffs.map(textField).filter(Boolean) : [],
+    generatedCode: textField(source.generatedCode) || textField(source.generated_code),
+    metrics,
+    candidateId: textField(source.candidateId),
+    runId: textField(source.runId),
+    runStatus: normalizeRunStatus(source.runStatus),
+    measured: isRecord(source.measured) ? source.measured as CandidateMeasurement : undefined,
+    logsUrl: textField(source.logsUrl),
+    codeUrl: textField(source.codeUrl),
+    selected: Boolean(source.selected),
+    applyState: normalizeApplyState(source.applyState),
+    applySummary: textField(source.applySummary) || undefined
+  };
+}
+
+function normalizeMetrics(raw: Record<string, unknown>): BenchMetricSet | undefined {
+  const metrics = {
+    readability: numberField(raw.readability),
+    simplicity: numberField(raw.simplicity),
+    speed: numberField(raw.speed),
+    memory: numberField(raw.memory),
+    maintainability: numberField(raw.maintainability),
+    testConfidence: numberField(raw.testConfidence ?? raw.test_confidence)
+  };
+  return Object.values(metrics).every((value) => typeof value === "number") ? metrics as BenchMetricSet : undefined;
+}
+
+function normalizeRunStatus(value: unknown): CandidateRunStatus {
+  return isCandidateRunStatus(value) ? value : "draft";
+}
+
+function normalizeApplyState(value: unknown): BenchOption["applyState"] {
+  return value === "previewed" || value === "applied" ? value : "idle";
+}
+
+function isCandidateRunStatus(value: unknown): value is CandidateRunStatus {
+  return (
+    value === "draft" ||
+    value === "queued" ||
+    value === "running" ||
+    value === "passed" ||
+    value === "failed" ||
+    value === "timeout" ||
+    value === "error"
+  );
+}
+
+function textField(value: unknown): string {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function numberField(value: unknown): number | undefined {
+  const numberValue = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numberValue) ? numberValue : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

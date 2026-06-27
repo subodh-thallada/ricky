@@ -1,8 +1,9 @@
 import * as vscode from "vscode";
+import { CandidateUpdate, DaemonSandboxRunner, RunCallbacks } from "./services/daemonSandboxRunner";
+import { DecisionPayload } from "./services/daemonClient";
 import { OrchestratorClient } from "./services/orchestratorClient";
 import { PreviewApplyProvider } from "./services/applyProvider";
-import { NoopSandboxRunner } from "./services/placeholders";
-import { BenchOption, ChatMessage, WorkspaceContext } from "./types";
+import { BenchFixtureId, BenchOption, BenchRunState, ChatMessage, WorkspaceContext } from "./types";
 
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new BenchChatViewProvider(context);
@@ -30,20 +31,22 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "bench.chatView";
 
   private view?: vscode.WebviewView;
-  private readonly detailsPanels = new Map<string, vscode.WebviewPanel>();
   private readonly orchestrator = new OrchestratorClient();
-  private readonly sandboxRunner = new NoopSandboxRunner();
+  private readonly sandboxRunner = new DaemonSandboxRunner();
   private readonly applyProvider = new PreviewApplyProvider();
   private messages: ChatMessage[] = [
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Cerebras will generate the options, and Bench will preview them directly in the editor as inline drafts."
+      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
     }
   ];
   private options: BenchOption[] = [];
   private selectedOptionId?: string;
-  private activeOptionsMessageId?: string;
+  private runState?: BenchRunState;
+  private currentRunAbort?: AbortController;
+  private lastPrompt = "";
+  private decisionLog: string[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -63,20 +66,23 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         case "askFeature":
           await this.askFeature(message.text ?? "");
           break;
-        case "viewMetrics":
-          this.toggleDetailsPanel(message.messageId, message.optionId, "metrics");
-          break;
-        case "viewCode":
-          this.toggleDetailsPanel(message.messageId, message.optionId, "code");
-          break;
         case "selectOption":
-          await this.selectOption(message.messageId, message.optionId);
+          await this.selectOption(message.optionId);
           break;
         case "applySelected":
-          await this.applySelected(message.messageId, message.optionId);
+          await this.applySelected(message.optionId);
           break;
-        case "rejectSelected":
-          await this.rejectSelected(message.messageId, message.optionId);
+        case "rejectPreview":
+          await this.rejectPreview(message.optionId);
+          break;
+        case "testAll":
+          await this.testAll();
+          break;
+        case "applyWinner":
+          await this.applyWinner();
+          break;
+        case "newFeatureChat":
+          this.reset();
           break;
       }
     });
@@ -92,7 +98,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     ];
     this.options = [];
     this.selectedOptionId = undefined;
-    this.activeOptionsMessageId = undefined;
+    this.runState = undefined;
+    this.decisionLog = [];
+    this.currentRunAbort?.abort();
+    this.currentRunAbort = undefined;
     this.postState();
   }
 
@@ -103,249 +112,365 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.messages.push({ id: createId("user"), role: "user", content: prompt });
-    this.postState({ loading: true, notice: "Asking Cerebras to generate implementation options..." });
+    this.lastPrompt = prompt;
+    this.runState = undefined;
+    this.postState({ loading: true, notice: "Asking Gemini to plan, then Cerebras to write code..." });
 
     try {
       const workspaceContext = getWorkspaceContext();
-      const result = await this.orchestrator.generateFeatureOptions(prompt, workspaceContext);
-      this.options = await this.sandboxRunner.run(result.options);
+      const result = await this.orchestrator.generateFeatureOptions(this.promptWithDecisionContext(prompt), workspaceContext);
+      this.options = result.options;
       this.selectedOptionId = undefined;
-      const messageId = createId("assistant");
-      this.activeOptionsMessageId = messageId;
       this.messages.push({
-        id: messageId,
+        id: createId("assistant"),
         role: "assistant",
-        content: result.message || `I generated ${this.options.length} implementation options with Cerebras. Bench attached local mock metrics for comparison.`,
-        options: cloneOptions(this.options)
+        content: result.message || `I generated ${this.options.length} implementation options. Run them to populate measured metrics.`,
+        options: this.options
       });
       this.postState();
     } catch (error) {
-      this.options = buildFallbackSuggestions(prompt);
-      const messageId = createId("assistant");
-      this.activeOptionsMessageId = messageId;
+      this.options = buildFastApiAuthFallbackSuggestions(prompt);
       this.messages.push({
-        id: messageId,
+        id: createId("assistant"),
         role: "assistant",
-        content: `I could not reach the Bench orchestrator, so I loaded local demo options instead. ${formatError(error)}`,
-        options: cloneOptions(this.options)
+        content: `I could not reach the Bench orchestrator, so I loaded local authenticated endpoint demo options that can still run through Docker. ${formatError(error)}`,
+        options: this.options
       });
       this.postState({ error: formatError(error) });
     }
   }
 
-  private async selectOption(messageId?: string, optionId?: string): Promise<void> {
-    const option = this.findOption(messageId, optionId);
-    if (!option || !messageId || !optionId) {
+  private async testAll(): Promise<void> {
+    if (this.currentRunAbort) {
       return;
     }
 
+    let fixtureId = this.pickFixtureId(this.options);
+    if (this.options.length < 2 || !fixtureId) {
+      this.options = buildFastApiAuthFallbackSuggestions(this.lastPrompt || "authenticated endpoint");
+      fixtureId = "fastapi-auth-endpoint";
+      this.messages.push({
+        id: createId("system"),
+        role: "system",
+        content: "Loaded local FastAPI authenticated endpoint demo options so Docker evaluation has runnable candidates."
+      });
+    }
+
+    const runnableOptions = this.validateOptionsForFixture(fixtureId, this.options);
+    if (runnableOptions.length < 2) {
+      this.options = buildFastApiAuthFallbackSuggestions(this.lastPrompt || "authenticated endpoint");
+      fixtureId = "fastapi-auth-endpoint";
+      this.messages.push({
+        id: createId("system"),
+        role: "system",
+        content: "The generated cards were not compatible with a runnable endpoint fixture, so Bench swapped in FastAPI authenticated endpoint demo candidates."
+      });
+    }
+
+    this.options = this.options.map((option) => ({
+      ...option,
+      runStatus: this.validateOptionsForFixture(fixtureId, [option]).length ? "queued" : option.runStatus,
+      measured: undefined,
+      candidateId: undefined,
+      runId: undefined,
+      logsUrl: undefined,
+      codeUrl: undefined
+    }));
+    this.runState = {
+      runId: "pending",
+      fixtureId,
+      status: "queued",
+      summary: "Preparing Docker evaluation..."
+    };
+    this.syncMessageOptions();
+    this.postState({ notice: "Starting local Docker evaluation..." });
+
+    const abortController = new AbortController();
+    this.currentRunAbort = abortController;
+
     try {
-      const sessionId = buildSessionId(messageId, optionId);
-      const preview = await this.applyProvider.preview(sessionId, option, getWorkspaceContext());
-      this.applySessionState(messageId, optionId, "previewed", preview.summary);
-      for (const deactivatedSessionId of preview.deactivatedSessionIds ?? []) {
-        const parsed = parseSessionId(deactivatedSessionId);
-        if (parsed) {
-          this.applySessionState(parsed.messageId, parsed.optionId, "idle");
-        }
-      }
-      this.selectedOptionId = option.id;
-      void vscode.window.showInformationMessage(
-        `Preview loaded for "${option.title}". Review the inline draft in the editor, then apply or reject from the selected card.`
+      const decision = await this.runFixture(
+        fixtureId,
+        this.options,
+        {
+          onRunCreated: (update) => {
+            this.runState = {
+              runId: update.runId,
+              fixtureId,
+              status: "running",
+              summary: `Docker run ${update.runId} created. Waiting for candidate results...`
+            };
+            this.applyCandidateUpdates(update.options);
+            this.postState({ notice: "Docker containers are running candidate tests..." });
+          },
+          onCandidateUpdate: (update) => {
+            this.applyCandidateUpdates([update]);
+            this.postState({ notice: `Candidate ${update.candidateId} is ${update.status}.` });
+          },
+          onDecision: (payload, updates) => {
+            this.applyDecision(payload, updates);
+            this.postState({ notice: payload.summary ?? "Docker evaluation completed." });
+          }
+        },
+        abortController.signal
       );
-      this.postState({ notice: preview.summary });
+      this.messages.push({
+        id: createId("assistant"),
+        role: "assistant",
+        content: buildDecisionMessage(decision)
+      });
+      this.syncMessageOptions();
+      this.postState();
     } catch (error) {
-      const errorMessage = `Bench could not preview "${option.title}". ${formatError(error)}`;
-      void vscode.window.showErrorMessage(errorMessage);
+      this.runState = {
+        runId: this.runState?.runId ?? "failed",
+        fixtureId,
+        status: "failed",
+        summary: formatError(error)
+      };
+      this.options = this.options.map((option) => (
+        option.runStatus === "queued" || option.runStatus === "running"
+          ? { ...option, runStatus: "error" }
+          : option
+      ));
+      this.syncMessageOptions();
+      this.messages.push({
+        id: createId("assistant"),
+        role: "assistant",
+        content: `Docker evaluation did not complete. ${formatError(error)}`,
+        options: this.options
+      });
       this.postState({ error: formatError(error) });
+    } finally {
+      if (this.currentRunAbort === abortController) {
+        this.currentRunAbort = undefined;
+      }
     }
   }
 
-  private async applySelected(messageId?: string, optionId?: string): Promise<void> {
-    if (!messageId || !optionId) {
+  private async applyWinner(): Promise<void> {
+    const winnerCandidateId = this.runState?.winnerCandidateId;
+    if (!winnerCandidateId) {
       return;
     }
+    const winner = this.options.find((option) => option.candidateId === winnerCandidateId);
+    if (!winner) {
+      return;
+    }
+    if (winner.applyState === "previewed") {
+      await this.applySelected(winner.id);
+      return;
+    }
+    await this.selectOption(winner.id);
+  }
+
+  private async selectOption(optionId?: string): Promise<void> {
+    const option = this.options.find((candidate) => candidate.id === optionId);
+    if (!option) {
+      return;
+    }
+
     try {
-      await this.clearSiblingPreviews(messageId, optionId);
-      const result = await this.applyProvider.applySelected(buildSessionId(messageId, optionId));
+      const preview = await this.applyProvider.preview(option.id, option, getWorkspaceContext());
+      const deactivated = new Set(preview.deactivatedSessionIds ?? []);
+      this.options = this.options.map((candidate) => {
+        if (candidate.id === option.id) {
+          return {
+            ...candidate,
+            selected: true,
+            applyState: "previewed",
+            applySummary: preview.summary
+          };
+        }
+        if (deactivated.has(candidate.id) || candidate.applyState === "previewed") {
+          return {
+            ...candidate,
+            selected: false,
+            applyState: "idle",
+            applySummary: undefined
+          };
+        }
+        return { ...candidate, selected: false };
+      });
+      this.selectedOptionId = option.id;
+      this.recordDecision(`User previewed "${option.title}". Summary: ${option.summary}`);
+      this.syncMessageOptions();
+      void vscode.window.showInformationMessage(`Preview loaded for "${option.title}". Review it in the editor before applying.`);
+      this.postState({ notice: preview.summary });
+    } catch (error) {
+      const message = `Bench could not preview "${option.title}". ${formatError(error)}`;
+      void vscode.window.showErrorMessage(message);
+      this.postState({ error: message });
+    }
+  }
+
+  private async applySelected(optionId?: string): Promise<void> {
+    const id = optionId ?? this.selectedOptionId;
+    const option = this.options.find((candidate) => candidate.id === id);
+    if (!option) {
+      return;
+    }
+
+    try {
+      const result = await this.applyProvider.applySelected(option.id);
       if (!result) {
+        await this.selectOption(option.id);
         return;
       }
 
-      this.finalizeAppliedMessage(messageId, optionId, result.summary);
-      this.selectedOptionId = result.optionId;
-      this.closeMessageDetailsPanels(messageId);
+      this.options = this.options.map((candidate) => (
+        candidate.id === option.id
+          ? {
+              ...candidate,
+              selected: true,
+              applyState: "applied",
+              applySummary: result.summary
+            }
+          : {
+              ...candidate,
+              selected: false,
+              applyState: candidate.applyState === "previewed" ? "idle" : candidate.applyState,
+              applySummary: candidate.applyState === "previewed" ? undefined : candidate.applySummary
+            }
+      ));
+      this.selectedOptionId = option.id;
+      this.recordDecision(`User applied "${option.title}". ${result.summary}`);
+      this.syncMessageOptions();
       void vscode.window.showInformationMessage(result.summary);
       this.postState({ notice: result.summary });
     } catch (error) {
-      const errorMessage = formatError(error);
-      void vscode.window.showErrorMessage(errorMessage);
-      this.postState({ error: errorMessage });
+      const message = formatError(error);
+      void vscode.window.showErrorMessage(message);
+      this.postState({ error: message });
     }
   }
 
-  private async rejectSelected(messageId?: string, optionId?: string): Promise<void> {
-    if (!messageId || !optionId) {
-      return;
-    }
-    const summary = await this.applyProvider.rejectSelected(buildSessionId(messageId, optionId));
-    if (!summary) {
-      return;
-    }
-
-    this.applySessionState(messageId, optionId, "idle");
-    this.closeOptionDetailsPanel(messageId, optionId);
-    this.selectedOptionId = undefined;
-    void vscode.window.showInformationMessage(summary);
-    this.postState({ notice: summary });
-  }
-
-  private toggleDetailsPanel(messageId?: string, optionId?: string, tab: "metrics" | "code" = "metrics"): void {
-    const option = this.findOption(messageId, optionId);
-    if (!option || !optionId || !messageId) {
+  private async rejectPreview(optionId?: string): Promise<void> {
+    const id = optionId ?? this.selectedOptionId;
+    const option = this.options.find((candidate) => candidate.id === id);
+    if (!option) {
       return;
     }
 
-    const panelKey = buildSessionId(messageId, optionId);
-    const existingPanel = this.detailsPanels.get(panelKey);
-    if (existingPanel) {
-      existingPanel.dispose();
-      return;
+    const summary = await this.applyProvider.rejectSelected(option.id);
+    this.options = this.options.map((candidate) => (
+      candidate.id === option.id
+        ? {
+            ...candidate,
+            selected: false,
+            applyState: "idle",
+            applySummary: undefined
+          }
+        : candidate
+    ));
+    if (this.selectedOptionId === option.id) {
+      this.selectedOptionId = undefined;
     }
-
-    const panel = vscode.window.createWebviewPanel(
-      "bench.metrics",
-      `Bench: ${option.title}`,
-      vscode.ViewColumn.Beside,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true
-      }
-    );
-    this.detailsPanels.set(panelKey, panel);
-    panel.onDidDispose(() => {
-      this.detailsPanels.delete(panelKey);
-    });
-    panel.webview.html = this.getDetailsHtml(panel.webview, option, tab);
-    panel.reveal(vscode.ViewColumn.Beside, false);
+    this.syncMessageOptions();
+    this.postState({ notice: summary ?? `Preview closed for ${option.title}.` });
   }
 
   private postState(extra: Partial<WebviewState> = {}): void {
     this.view?.webview.postMessage({
       type: "state",
-        state: {
+      state: {
         messages: this.messages,
         options: this.options,
         selectedOptionId: this.selectedOptionId,
+        runState: this.runState,
         loading: false,
         ...extra
       } satisfies WebviewState
     });
   }
 
-  private syncActiveOptionsMessage(): void {
-    if (!this.activeOptionsMessageId) {
-      return;
-    }
-
-    this.messages = this.messages.map((message) => (
-      message.id === this.activeOptionsMessageId
-        ? { ...message, options: cloneOptions(this.options) }
-        : message
-    ));
-  }
-
-  private findOption(messageId?: string, optionId?: string): BenchOption | undefined {
-    if (!messageId || !optionId) {
-      return undefined;
-    }
-    const message = this.messages.find((item) => item.id === messageId);
-    return message?.options?.find((option) => option.id === optionId);
-  }
-
-  private applySessionState(
-    messageId: string,
-    optionId: string,
-    applyState: BenchOption["applyState"],
-    applySummary?: string
-  ): void {
-    this.messages = this.messages.map((message) => {
-      if (message.id !== messageId || !message.options) {
-        return message;
+  private applyCandidateUpdates(updates: CandidateUpdate[]): void {
+    const byOptionId = new Map(updates.map((update) => [update.optionId, update]));
+    this.options = this.options.map((option) => {
+      const update = byOptionId.get(option.id);
+      if (!update) {
+        return option;
       }
       return {
-        ...message,
-        options: message.options.map((option) => (
-          option.id === optionId
-            ? { ...option, selected: applyState === "previewed" || applyState === "applied", applyState, applySummary }
-            : option
-        ))
-      };
-    });
-
-    if (this.activeOptionsMessageId === messageId) {
-      this.options = (this.messages.find((message) => message.id === messageId)?.options ?? []).map((option) => ({
         ...option,
-        metrics: { ...option.metrics },
-        tradeoffs: [...option.tradeoffs]
-      }));
-    }
-  }
-
-  private closeOptionDetailsPanel(messageId: string, optionId: string): void {
-    this.detailsPanels.get(buildSessionId(messageId, optionId))?.dispose();
-  }
-
-  private closeMessageDetailsPanels(messageId: string): void {
-    for (const [panelKey, panel] of this.detailsPanels) {
-      if (panelKey.startsWith(`${messageId}::`)) {
-        panel.dispose();
-      }
-    }
-  }
-
-  private async clearSiblingPreviews(messageId: string, appliedOptionId: string): Promise<void> {
-    const message = this.messages.find((item) => item.id === messageId);
-    if (!message?.options) {
-      return;
-    }
-
-    for (const option of message.options) {
-      if (option.id === appliedOptionId) {
-        continue;
-      }
-      const sessionId = buildSessionId(messageId, option.id);
-      if (!this.applyProvider.hasPendingSession(sessionId)) {
-        continue;
-      }
-      await this.applyProvider.rejectSelected(sessionId);
-      this.applySessionState(messageId, option.id, "idle");
-    }
-  }
-
-  private finalizeAppliedMessage(messageId: string, optionId: string, summary: string): void {
-    this.messages = this.messages.map((message) => {
-      if (message.id !== messageId || !message.options) {
-        return message;
-      }
-
-      const appliedOption = message.options.find((option) => option.id === optionId);
-      if (!appliedOption) {
-        return message;
-      }
-
-      return {
-        ...message,
-        options: undefined,
-        appliedOptionId: appliedOption.id,
-        appliedOptionTitle: appliedOption.title,
-        appliedSummary: summary
+        candidateId: update.candidateId,
+        runId: update.runId ?? option.runId,
+        runStatus: update.status,
+        measured: update.measured ?? option.measured,
+        logsUrl: update.logsUrl ?? option.logsUrl,
+        codeUrl: update.codeUrl ?? option.codeUrl
       };
     });
+    this.syncMessageOptions();
+  }
 
-    if (this.activeOptionsMessageId === messageId) {
-      this.options = [];
+  private applyDecision(payload: DecisionPayload, updates: CandidateUpdate[]): void {
+    this.applyCandidateUpdates(updates);
+    this.runState = {
+      runId: payload.run_id,
+      fixtureId: payload.fixture_id as BenchFixtureId,
+      status: payload.status,
+      winnerCandidateId: payload.winner_candidate_id,
+      summary: payload.summary
+    };
+    this.recordDecision(buildDecisionLogEntry(payload));
+  }
+
+  private recordDecision(entry: string): void {
+    this.decisionLog.push(entry);
+    this.decisionLog = this.decisionLog.slice(-8);
+  }
+
+  private promptWithDecisionContext(prompt: string): string {
+    if (!this.decisionLog.length) {
+      return prompt;
     }
+    return [
+      prompt,
+      "",
+      "Existing Bench planning context from this chat:",
+      ...this.decisionLog.map((entry, index) => `${index + 1}. ${entry}`),
+      "",
+      "Use this context when generating the next options. Preserve decisions the user already made unless the new prompt explicitly changes them."
+    ].join("\n");
+  }
+
+  private pickFixtureId(options: BenchOption[]): BenchFixtureId | undefined {
+    if (this.sandboxRunner.validateFastApiAuthOptions(options).length >= 2) {
+      return "fastapi-auth-endpoint";
+    }
+    if (this.sandboxRunner.validatePythonMergeOptions(options).length >= 2) {
+      return "python-merge";
+    }
+    return undefined;
+  }
+
+  private validateOptionsForFixture(fixtureId: BenchFixtureId, options: BenchOption[]): BenchOption[] {
+    return fixtureId === "fastapi-auth-endpoint"
+      ? this.sandboxRunner.validateFastApiAuthOptions(options)
+      : this.sandboxRunner.validatePythonMergeOptions(options);
+  }
+
+  private async runFixture(
+    fixtureId: BenchFixtureId,
+    options: BenchOption[],
+    callbacks: RunCallbacks,
+    signal?: AbortSignal
+  ): Promise<DecisionPayload> {
+    return fixtureId === "fastapi-auth-endpoint"
+      ? this.sandboxRunner.runFastApiAuthEndpoint(options, callbacks, signal)
+      : this.sandboxRunner.runPythonMerge(options, callbacks, signal);
+  }
+
+  private syncMessageOptions(): void {
+    let replaced = false;
+    this.messages = [...this.messages].reverse().map((message) => {
+      if (!replaced && message.options) {
+        replaced = true;
+        return { ...message, options: this.options };
+      }
+      return message;
+    }).reverse();
   }
 
   private getChatHtml(webview: vscode.Webview): string {
@@ -362,163 +487,960 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 <style>
   :root {
     color-scheme: dark;
-    --bg: var(--vscode-sideBar-background);
-    --panel: var(--vscode-editor-background);
-    --card: var(--vscode-input-background);
-    --border: var(--vscode-panel-border);
-    --text: var(--vscode-foreground);
-    --muted: var(--vscode-descriptionForeground);
-    --accent: #8b6bff;
-    --accent2: #19e3ff;
-    --good: #73c991;
-    --warn: #cca700;
+    --bg: #0e0e0e;
+    --surface: #131313;
+    --surface-raised: #1c1b1b;
+    --surface-high: #201f1f;
+    --surface-track: #1a1a1a;
+    --border: #1f1f1f;
+    --border-strong: #333333;
+    --text: #e5e2e1;
+    --text-soft: #c2c6d7;
+    --mute: #8c90a0;
+    --dim: #5f6573;
+    --primary: #7aa2ff;
+    --primary-strong: #3e7bfa;
+    --pass: #63d471;
+    --fail: #ff6f61;
+    --run: #b1c5ff;
+    --warn: #ffb68c;
+    --btn-fill: #b1c5ff;
+    --btn-text: #071633;
+    --mono: 'JetBrains Mono', var(--vscode-editor-font-family), monospace;
+    --sans: 'Geist', var(--vscode-font-family), system-ui, sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: var(--vscode-font-family); color: var(--text); background: var(--bg); }
-  .app { height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
-  header { padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
-  .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; }
-  .bolt { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; color: #09090f; background: linear-gradient(120deg,var(--accent),var(--accent2)); }
-  .sub { margin-top: 4px; font-size: 12px; color: var(--muted); line-height: 1.35; }
-  main { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 10px; line-height: 1.45; }
-  .msg.user { background: color-mix(in srgb, var(--accent) 15%, var(--panel)); }
-  .msg.system { color: var(--muted); font-size: 12px; }
-  .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
-  .cards { display: flex; flex-direction: column; gap: 9px; margin-top: 10px; }
-  .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 10px; }
-  .card.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent2) 35%, transparent); }
-  .cardTop { display: flex; justify-content: space-between; gap: 8px; align-items: start; }
-  .title { font-weight: 700; line-height: 1.25; }
-  .summary { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
-  .selectedBadge { font-size: 10px; color: #09090f; background: linear-gradient(120deg,var(--accent),var(--accent2)); border-radius: 999px; padding: 3px 7px; font-weight: 700; white-space: nowrap; }
-  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-  button { border: 1px solid var(--vscode-button-border, transparent); color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-radius: 6px; padding: 6px 9px; cursor: pointer; font: inherit; font-size: 12px; }
-  button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  button.secondary:hover { background: var(--vscode-list-hoverBackground); }
-  .composer { border-top: 1px solid var(--border); padding: 10px; display: grid; grid-template-columns: 1fr auto; gap: 8px; background: var(--panel); }
-  textarea { resize: none; min-height: 42px; max-height: 140px; border-radius: 8px; border: 1px solid var(--border); background: var(--vscode-input-background); color: var(--text); padding: 9px; font: inherit; }
-  .status { grid-column: 1 / -1; min-height: 18px; font-size: 12px; color: var(--muted); }
-  .error { color: var(--vscode-errorForeground); }
-  .empty { color: var(--muted); font-size: 12px; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; }
+  html {
+    height: 100%;
+    overflow: hidden;
+  }
+  button, input { font: inherit; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 18px;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(19, 19, 19, 0.94);
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .brand { display: grid; gap: 2px; min-width: 0; }
+  .brand-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .brand-mark {
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border-strong);
+    border-radius: 5px;
+    background: var(--surface-high);
+    color: var(--primary);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .title {
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 20px;
+    letter-spacing: -0.01em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sub {
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    line-height: 12px;
+    text-transform: uppercase;
+  }
+  .icons { display: flex; gap: 6px; }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--text-soft);
+    cursor: pointer;
+    transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+  }
+  .icon-btn:hover {
+    background: var(--surface-high);
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+  .chat {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+  .chat::-webkit-scrollbar { width: 8px; }
+  .chat::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; border: 2px solid var(--bg); }
+  .msg {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: rgba(19, 19, 19, 0.72);
+    color: var(--text-soft);
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .msg.user {
+    padding: 12px;
+    background: transparent;
+    color: var(--text);
+  }
+  .msg.assistant {
+    display: flex;
+    gap: 10px;
+    flex-direction: column;
+    padding: 10px;
+  }
+  .msg.system {
+    padding: 10px;
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 16px;
+  }
+  .msg-content {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 8px;
+    align-items: flex-start;
+    min-width: 0;
+  }
+  .msg-content > div { min-width: 0; overflow-wrap: anywhere; }
+  .agent-dot {
+    width: 20px;
+    height: 20px;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    background: var(--surface-high);
+    display: grid;
+    place-items: center;
+  }
+  .agent-dot i { width: 13px; height: 13px; }
+  .cards { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+    transition: background 160ms ease, border-color 160ms ease;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 3px;
+    background: var(--dim);
+  }
+  .card:hover { border-color: var(--border-strong); background: var(--surface-raised); }
+  .card.selected { border-color: rgba(177, 197, 255, 0.64); box-shadow: inset 0 0 0 1px rgba(177, 197, 255, 0.14); }
+  .card.passed::before { background: var(--pass); }
+  .card.failed::before, .card.error::before, .card.timeout::before { background: var(--fail); }
+  .card.running::before, .card.queued::before { background: var(--run); }
+  .card.selected::before { background: var(--primary); }
+  .card-top {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: start;
+    padding: 10px 10px 8px 12px;
+  }
+  .card-title-wrap { display: grid; gap: 6px; min-width: 0; }
+  .card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+  .badge, .status-pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 14px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .badge {
+    color: var(--primary);
+    background: rgba(177, 197, 255, 0.08);
+    border: 1px solid rgba(177, 197, 255, 0.18);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .status-pill { color: var(--mute); }
+  .passed .status-pill { color: var(--pass); }
+  .failed .status-pill, .error .status-pill, .timeout .status-pill { color: var(--fail); }
+  .running .status-pill, .queued .status-pill { color: var(--run); }
+  .card-title {
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 19px;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+  }
+  .card-summary {
+    color: var(--mute);
+    font-size: 12px;
+    line-height: 16px;
+    padding: 0 10px 10px 12px;
+  }
+  .status-icon i { width: 16px; height: 16px; }
+  .running .status-icon i, .queued .status-icon i { animation: spin 2s linear infinite; }
+  @keyframes spin { 100% { transform: rotate(360deg); } }
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 7px;
+    padding: 0 10px 10px 12px;
+  }
+  .metric-col { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .metric-title, .metric-val {
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .metric-title { color: var(--mute); text-transform: uppercase; letter-spacing: 0.04em; }
+  .metric-bar-bg { height: 4px; background: var(--surface-track); border-radius: 999px; width: 100%; overflow: hidden; }
+  .metric-bar-fg { height: 100%; border-radius: inherit; width: 100%; background: var(--dim); }
+  .passed .metric-bar-fg { background: var(--pass); }
+  .failed .metric-bar-fg, .error .metric-bar-fg, .timeout .metric-bar-fg { background: var(--fail); }
+  .running .metric-bar-fg, .queued .metric-bar-fg { background: var(--run); }
+  .draft .metric-bar-fg { background: var(--mute); }
+  .metric-val { color: var(--text-soft); }
+  .failed .metric-val, .error .metric-val, .timeout .metric-val { color: var(--fail); }
+  .running .metric-val, .queued .metric-val { color: var(--mute); }
+  .card-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 10px 9px 12px;
+    border-top: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.16);
+  }
+  .left-actions { display: flex; gap: 10px; min-width: 0; }
+  .action-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: none;
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 14px;
+    cursor: pointer;
+    padding: 2px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    transition: color 160ms ease;
+  }
+  .action-btn:hover { color: var(--text); }
+  .failed .action-btn.view-logs, .error .action-btn.view-logs, .timeout .action-btn.view-logs { color: var(--fail); }
+  .select-btn {
+    background: var(--btn-fill);
+    color: var(--btn-text);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 11px;
+    line-height: 16px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 160ms ease, border-color 160ms ease, color 160ms ease, filter 160ms ease;
+  }
+  .selected .select-btn { background: transparent; color: var(--run); border-color: rgba(177, 197, 255, 0.42); }
+  .select-btn:hover { filter: brightness(1.08); }
+  .select-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:disabled { cursor: not-allowed; opacity: 0.52; }
+  .composer-wrap {
+    flex-shrink: 0;
+    padding: 10px 12px 12px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+  .run-bar {
+    display: none;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 7px 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .run-bar.visible { display: flex; }
+  .run-status {
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 14px;
+    color: var(--mute);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+  .run-actions { display: flex; gap: 8px; }
+  .outline-btn {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-soft);
+    padding: 4px 8px;
+    font-size: 10px;
+    line-height: 14px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+  }
+  .outline-btn:hover:not(:disabled) { border-color: var(--text); color: var(--text); }
+  .outline-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .input-box {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    padding: 8px 8px 8px 10px;
+  }
+  .input-box:focus-within { border-color: var(--primary); }
+  .input-box i { flex-shrink: 0; cursor: pointer; }
+  .input-box input { flex: 1; min-width: 0; background: transparent; border: none; color: var(--text); font-family: var(--sans); font-size: 13px; outline: none; }
+  .input-box input::placeholder { color: var(--mute); }
+  .send-btn { width: 26px; height: 26px; border: 1px solid transparent; border-radius: 4px; display: grid; place-items: center; background: transparent; padding: 0; cursor: pointer; transition: background 160ms ease, border-color 160ms ease; }
+  .send-btn:hover { background: var(--surface-high); border-color: var(--border-strong); }
+  .composer-status {
+    min-height: 14px;
+    margin-bottom: 8px;
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 14px;
+    letter-spacing: 0.02em;
+  }
+  .composer-status.error { color: var(--fail); }
+  .inline-details {
+    display: grid;
+    gap: 8px;
+    padding: 10px 10px 10px 12px;
+    border-top: 1px solid var(--border);
+    background: #0f0f0f;
+  }
+  .detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .detail-stat {
+    min-width: 0;
+    padding: 7px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+  }
+  .detail-label {
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 14px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .detail-value {
+    margin-top: 2px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .detail-section {
+    display: grid;
+    gap: 4px;
+    color: var(--text-soft);
+    font-size: 12px;
+    line-height: 16px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .detail-section-title {
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 14px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .detail-list {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .detail-list li {
+    padding-left: 10px;
+    position: relative;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .detail-list li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 7px;
+    width: 4px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--outline-dot, var(--dim));
+  }
+  .issue-list li::before { background: var(--fail); }
+  .empty-detail { color: var(--mute); font-family: var(--mono); font-size: 10px; line-height: 14px; }
+  button:focus-visible, input:focus-visible, .icon-btn:focus-visible {
+    outline: 1px solid var(--primary);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+  @media (max-width: 300px) {
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+  .svg-sparkle { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23b1c5ff' d='M11.5 2L13 8l6 1.5-6 1.5-1.5 6-1.5-6-6-1.5 6-1.5z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; }
+  .svg-check { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2363d471' d='M9.6 16.2 5.8 12.4l1.4-1.4 2.4 2.4 7.2-7.2 1.4 1.4z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 16px; height: 16px; }
+  .svg-spin { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23b1c5ff' d='M12 4V2C6.48 2 2 6.48 2 12h2c0-4.41 3.59-8 8-8z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 16px; height: 16px; }
+  .svg-alert { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23ff6f61' d='M11 6h2v8h-2zm0 10h2v2h-2z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 16px; height: 16px; }
+  .svg-draft { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='6' fill='none' stroke='%238c90a0' stroke-width='2'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 16px; height: 16px; }
+  .svg-metrics { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%238c90a0' d='M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 14px; height: 14px; }
+  .svg-logs { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%238c90a0' d='M20 19H4v-1h16v1zm0-14H4v1h16V5zm0 7H4v1h16v-1z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 14px; height: 14px; }
+  .svg-send { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23b1c5ff' d='M2.01 21 23 12 2.01 3 2 10l15 2-15 2z'/%3E%3C/svg%3E") no-repeat center / contain; width: 15px; height: 15px; display: inline-block; }
+  .svg-plus { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23c2c6d7' d='M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z'/%3E%3C/svg%3E") no-repeat center / contain; width: 16px; height: 16px; display: inline-block; }
 </style>
 </head>
 <body>
-  <div class="app">
-    <header>
-      <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Cerebras generates options. Bench scores locally and previews changes directly in the editor before you apply them.</div>
-    </header>
-    <main id="messages"></main>
-    <form class="composer" id="form">
-      <textarea id="input" placeholder="Ask Bench to build a feature..."></textarea>
-      <button id="send" type="submit">Send</button>
-      <div class="status" id="status"></div>
+  <div class="header">
+    <div class="brand">
+      <div class="brand-row"><span class="brand-mark">B</span><span class="title">Bench</span></div>
+      <div class="sub">AI developer sidepanel</div>
+    </div>
+    <div class="icons">
+      <button class="icon-btn" type="button" title="New Chat" aria-label="Start new chat" data-action="newChat"><i class="svg-plus"></i></button>
+    </div>
+  </div>
+
+  <div class="chat" id="messages"></div>
+
+  <div class="composer-wrap">
+    <div class="run-bar" id="runBar"></div>
+    <div class="composer-status" id="status" aria-live="polite"></div>
+    <form id="form" class="input-box">
+      <span class="svg-plus" aria-hidden="true"></span>
+      <input type="text" id="input" placeholder="Ask Bench to build or refine..." autocomplete="off" aria-label="Feature request">
+      <button class="send-btn" type="submit" title="Send"><i class="svg-send"></i></button>
     </form>
   </div>
+
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const messagesEl = document.getElementById('messages');
     const formEl = document.getElementById('form');
     const inputEl = document.getElementById('input');
-    const sendEl = document.getElementById('send');
+    const runBarEl = document.getElementById('runBar');
     const statusEl = document.getElementById('status');
-    let state = { messages: [], options: [], loading: false };
+    const sendEl = document.querySelector('.send-btn');
+
+    let state = normalizeState({ messages: [], options: [], loading: false });
+    const expandedOptionIds = new Set();
 
     window.addEventListener('message', (event) => {
-      if (event.data.type !== 'state') return;
-      state = event.data.state;
-      render();
+      const data = event.data;
+      if (data && data.type === 'state') {
+        state = normalizeState(data.state);
+        render();
+      }
     });
 
     formEl.addEventListener('submit', (event) => {
       event.preventDefault();
       const text = inputEl.value.trim();
       if (!text || state.loading) return;
-      vscode.postMessage({ type: 'askFeature', text });
       inputEl.value = '';
+      state = normalizeState({
+        ...state,
+        loading: true,
+        notice: 'Planning approaches...',
+        error: undefined,
+        messages: [
+          ...(state.messages || []),
+          { id: 'local-user-' + Date.now(), role: 'user', content: text }
+        ]
+      });
+      render();
+      vscode.postMessage({ type: 'askFeature', text });
     });
 
-    messagesEl.addEventListener('click', (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) return;
-      const card = target.closest('[data-option-id]');
-      const optionId = card?.getAttribute('data-option-id');
-      const messageId = card?.getAttribute('data-message-id');
-      const action = target.getAttribute('data-action');
-      if (!optionId || !action) return;
-      vscode.postMessage({ type: action, optionId, messageId });
+    document.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      if (!target) return;
+
+      let actionNode = target.closest('[data-action]');
+      if (!actionNode) actionNode = target;
+
+      const action = actionNode.getAttribute('data-action');
+      const optionId = target.closest('[data-option-id]')?.getAttribute('data-option-id');
+
+      if (action === 'newChat') {
+        expandedOptionIds.clear();
+        vscode.postMessage({ type: 'newFeatureChat' });
+      }
+      else if (action === 'toggleDetails' && optionId) {
+        if (expandedOptionIds.has(optionId)) expandedOptionIds.delete(optionId);
+        else expandedOptionIds.add(optionId);
+        render();
+      }
+      else if (action && optionId) vscode.postMessage({ type: action, optionId });
+      else if (action) vscode.postMessage({ type: action });
     });
+
+    function normalizeState(next) {
+      const source = isRecord(next) ? next : {};
+      const messages = Array.isArray(source.messages)
+        ? source.messages.map(normalizeMessage).filter(Boolean)
+        : [];
+      const options = Array.isArray(source.options)
+        ? source.options.map(normalizeOption).filter(Boolean)
+        : [];
+
+      return {
+        messages,
+        options,
+        selectedOptionId: textOrUndefined(source.selectedOptionId),
+        runState: isRecord(source.runState) ? source.runState : undefined,
+        loading: Boolean(source.loading),
+        notice: textOrUndefined(source.notice),
+        error: textOrUndefined(source.error)
+      };
+    }
+
+    function normalizeMessage(raw, index) {
+      const source = isRecord(raw) ? raw : {};
+      const role = source.role === 'user' || source.role === 'system' || source.role === 'assistant'
+        ? source.role
+        : 'assistant';
+      const message = {
+        id: textOrUndefined(source.id) || 'message-' + index,
+        role,
+        content: textOrEmpty(source.content)
+      };
+      if (Array.isArray(source.options)) {
+        message.options = source.options.map(normalizeOption).filter(Boolean);
+      }
+      return message;
+    }
+
+    function normalizeOption(raw, index) {
+      const source = isRecord(raw) ? raw : {};
+      return {
+        id: textOrUndefined(source.id) || 'option-' + index,
+        title: textOrUndefined(source.title) || 'Untitled option',
+        summary: textOrEmpty(source.summary),
+        implementationPlan: textOrUndefined(source.implementationPlan) || textOrUndefined(source.implementation_plan) || '',
+        tradeoffs: Array.isArray(source.tradeoffs) ? source.tradeoffs.map(textOrEmpty) : [],
+        generatedCode: textOrUndefined(source.generatedCode) || textOrUndefined(source.generated_code) || '',
+        metrics: isRecord(source.metrics) ? source.metrics : undefined,
+        candidateId: textOrUndefined(source.candidateId),
+        runId: textOrUndefined(source.runId),
+        runStatus: normalizeRunStatus(source.runStatus),
+        measured: isRecord(source.measured) ? source.measured : undefined,
+        logsUrl: textOrUndefined(source.logsUrl),
+        codeUrl: textOrUndefined(source.codeUrl),
+        selected: Boolean(source.selected),
+        applyState: normalizeApplyState(source.applyState),
+        applySummary: textOrUndefined(source.applySummary)
+      };
+    }
+
+    function normalizeApplyState(value) {
+      const state = textOrUndefined(value);
+      return ['idle', 'previewed', 'applied'].includes(state) ? state : 'idle';
+    }
+
+    function normalizeRunStatus(value) {
+      const status = textOrUndefined(value);
+      return ['draft', 'queued', 'running', 'passed', 'failed', 'timeout', 'error'].includes(status) ? status : 'draft';
+    }
+
+    function normalizeTests(value) {
+      if (!isRecord(value)) return undefined;
+      const passed = Number(value.passed);
+      const failed = Number(value.failed);
+      const total = Number(value.total);
+      if (!Number.isFinite(passed) || !Number.isFinite(failed) || !Number.isFinite(total)) return undefined;
+      return { passed, failed, total };
+    }
+
+    function isRecord(value) {
+      return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function textOrUndefined(value) {
+      return value === undefined || value === null ? undefined : String(value);
+    }
+
+    function textOrEmpty(value) {
+      return value === undefined || value === null ? '' : String(value);
+    }
+
+    function percent(value) {
+      const numberValue = Number(value);
+      if (!Number.isFinite(numberValue)) return '0%';
+      return Math.max(0, Math.min(100, numberValue)) + '%';
+    }
 
     function render() {
-      sendEl.disabled = Boolean(state.loading);
-      statusEl.textContent = state.loading ? 'Cerebras generating implementation options...' : (state.notice || '');
-      statusEl.className = state.error ? 'status error' : 'status';
-      messagesEl.innerHTML = '';
+      try {
+        inputEl.disabled = Boolean(state.loading);
+        sendEl.disabled = Boolean(state.loading);
+        statusEl.textContent = state.loading ? 'Planning approaches...' : (state.notice || state.error || '');
+        statusEl.className = state.error ? 'composer-status error' : 'composer-status';
+        renderRunBar();
 
-      for (const message of state.messages) {
-        const node = document.createElement('section');
-        node.className = 'msg ' + message.role;
-        node.innerHTML = '<div class="role">' + escapeHtml(message.role) + '</div><div>' + escapeHtml(message.content) + '</div>';
-        if (message.appliedOptionTitle) {
-          node.appendChild(renderAppliedMessage(message));
-        } else if (message.options?.length) {
-          node.appendChild(renderCards(message.id, message.options));
+        const nextMessages = document.createDocumentFragment();
+        for (const message of state.messages || []) {
+          const node = document.createElement('div');
+          node.className = 'msg ' + (message.role || 'assistant');
+          if (message.role === 'user') {
+            node.textContent = String(message.content || '');
+          } else if (message.role === 'system') {
+            node.textContent = String(message.content || '');
+          } else {
+            const content = document.createElement('div');
+            content.className = 'msg-content';
+            const dot = document.createElement('span');
+            dot.className = 'agent-dot';
+            const dotIcon = document.createElement('i');
+            dotIcon.className = 'svg-sparkle';
+            dot.appendChild(dotIcon);
+            const text = document.createElement('div');
+            text.textContent = String(message.content || '');
+            content.appendChild(dot);
+            content.appendChild(text);
+            node.appendChild(content);
+            if (Array.isArray(message.options) && message.options.length) {
+              node.appendChild(renderCards(message.options));
+            }
+          }
+          nextMessages.appendChild(node);
         }
-        messagesEl.appendChild(node);
+        messagesEl.replaceChildren(nextMessages);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      } catch (error) {
+        console.error('Bench render failed', error);
+        statusEl.textContent = 'Bench UI render failed. Check the extension host developer tools.';
+        statusEl.className = 'composer-status error';
+        if (!messagesEl.children.length) {
+          const node = document.createElement('div');
+          node.className = 'msg system';
+          node.textContent = error && error.message ? error.message : String(error);
+          messagesEl.appendChild(node);
+        }
       }
-
-      if (state.messages.length === 0) {
-        messagesEl.innerHTML = '<div class="empty">Start with a feature request.</div>';
-      }
-
-      messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    function renderCards(messageId, options) {
+    function renderRunBar() {
+      const hasOptions = (state.options || []).length >= 2;
+      const isRunning = (state.runState && state.runState.status === 'running') || (state.options || []).some(o => o.runStatus === 'queued' || o.runStatus === 'running');
+      const canApply = Boolean(state.runState && state.runState.winnerCandidateId);
+
+      runBarEl.className = hasOptions ? 'run-bar visible' : 'run-bar';
+      if (!hasOptions) {
+        runBarEl.replaceChildren();
+        return;
+      }
+
+      const label = (state.runState && state.runState.summary) || (isRunning ? 'Running tests...' : 'Ready to test approaches.');
+      const icon = isRunning ? '<i class="svg-spin"></i>' : '';
+
+      runBarEl.innerHTML = \`
+        <div class="run-status">\${icon}\${escapeHtml(label)}</div>
+        <div class="run-actions">
+          <button class="outline-btn" data-action="testAll" \${isRunning ? 'disabled' : ''}>Test all</button>
+          <button class="outline-btn" data-action="applyWinner" \${!canApply ? 'disabled' : ''}>Preview/apply winner</button>
+        </div>
+      \`;
+    }
+
+    function renderCards(options) {
       const wrap = document.createElement('div');
       wrap.className = 'cards';
-      for (const option of options) {
-        const card = document.createElement('article');
-        card.className = 'card' + (option.selected ? ' selected' : '');
-        card.setAttribute('data-option-id', option.id);
-        card.setAttribute('data-message-id', messageId);
-        card.innerHTML = \`
-          <div class="cardTop">
-            <div>
-              <div class="title">\${escapeHtml(option.title)}</div>
-              <div class="summary">\${escapeHtml(option.summary)}</div>
-            </div>
-            \${option.applyState === 'applied' ? '<span class="selectedBadge">Applied</span>' : option.selected ? '<span class="selectedBadge">Preview Ready</span>' : ''}
-          </div>
-          \${option.applyState === 'applied'
-            ? '<div class="summary">This implementation has been applied and locked in.</div>'
-            : \`<div class="actions">
-                <button class="secondary" data-action="viewMetrics" type="button">View Details</button>
-                <button data-action="\${option.selected ? 'rejectSelected' : 'selectOption'}" type="button">\${option.selected ? 'Hide Preview' : 'Show in Code'}</button>
-                \${option.selected ? '<button data-action="applySelected" type="button">Accept</button>' : ''}
-              </div>\`}\`;
+      options.forEach((option, index) => {
+        option = option || {};
+        const status = String(option.runStatus || 'draft');
+        const letter = String.fromCharCode(65 + index);
+        const statusLabel = status.replace(/_/g, ' ');
+        const isExpanded = expandedOptionIds.has(option.id);
+
+        let iconClass = 'svg-draft';
+        if (status === 'passed') iconClass = 'svg-check';
+        else if (status === 'failed' || status === 'error' || status === 'timeout') iconClass = 'svg-alert';
+        else if (status === 'running' || status === 'queued') iconClass = 'svg-spin';
+
+        const card = document.createElement('div');
+        card.className = 'card ' + status + (option.selected ? ' selected' : '');
+        card.setAttribute('data-option-id', String(option.id || ''));
+
+        const top = document.createElement('div');
+        top.className = 'card-top';
+        const titleWrap = document.createElement('div');
+        titleWrap.className = 'card-title-wrap';
+        const meta = document.createElement('div');
+        meta.className = 'card-meta';
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.textContent = 'APPROACH ' + letter;
+        const pill = document.createElement('span');
+        pill.className = 'status-pill';
+        pill.textContent = statusLabel;
+        meta.appendChild(badge);
+        meta.appendChild(pill);
+        const title = document.createElement('span');
+        title.className = 'card-title';
+        title.textContent = String(option.title || 'Untitled option');
+        titleWrap.appendChild(meta);
+        titleWrap.appendChild(title);
+        const statusIcon = document.createElement('div');
+        statusIcon.className = 'status-icon';
+        const statusIconInner = document.createElement('i');
+        statusIconInner.className = iconClass;
+        statusIcon.appendChild(statusIconInner);
+        top.appendChild(titleWrap);
+        top.appendChild(statusIcon);
+        card.appendChild(top);
+
+        if (option.summary) {
+          const summary = document.createElement('div');
+          summary.className = 'card-summary';
+          summary.textContent = String(option.summary);
+          card.appendChild(summary);
+        }
+
+        card.appendChild(renderMetrics(option, status));
+
+        if (isExpanded) {
+          const details = document.createElement('div');
+          details.innerHTML = renderInlineDetails(option, status);
+          card.appendChild(details.firstElementChild || details);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'card-actions';
+        const leftActions = document.createElement('div');
+        leftActions.className = 'left-actions';
+        const isApplied = option.applyState === 'applied';
+        const isPreviewed = option.applyState === 'previewed' || option.selected;
+        const detailButton = document.createElement('button');
+        detailButton.className = 'action-btn view-logs';
+        detailButton.type = 'button';
+        detailButton.dataset.action = 'toggleDetails';
+        detailButton.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+        const detailIcon = document.createElement('i');
+        detailIcon.className = 'svg-' + (status === 'failed' || status === 'error' ? 'logs' : 'metrics');
+        detailButton.appendChild(detailIcon);
+        detailButton.appendChild(document.createTextNode(' ' + (isExpanded ? 'Hide Details' : (status === 'failed' || status === 'error' ? 'View Logs' : 'Details'))));
+        leftActions.appendChild(detailButton);
+        const selectButton = document.createElement('button');
+        selectButton.className = 'select-btn';
+        selectButton.type = 'button';
+        selectButton.dataset.action = isPreviewed ? 'rejectPreview' : 'selectOption';
+        selectButton.disabled = isApplied;
+        selectButton.textContent = isApplied ? 'Applied' : (isPreviewed ? 'Reject' : 'Preview');
+        actions.appendChild(leftActions);
+        if (isPreviewed && !isApplied) {
+          const applyButton = document.createElement('button');
+          applyButton.className = 'select-btn';
+          applyButton.type = 'button';
+          applyButton.dataset.action = 'applySelected';
+          applyButton.textContent = 'Apply';
+          actions.appendChild(applyButton);
+        }
+        actions.appendChild(selectButton);
+        card.appendChild(actions);
+        if (option.applySummary) {
+          const applySummary = document.createElement('div');
+          applySummary.className = 'card-summary';
+          applySummary.textContent = String(option.applySummary);
+          card.appendChild(applySummary);
+        }
         wrap.appendChild(card);
-      }
+      });
       return wrap;
     }
 
-    function renderAppliedMessage(message) {
-      const wrap = document.createElement('div');
-      wrap.className = 'cards';
-      const card = document.createElement('article');
-      card.className = 'card selected';
-      card.innerHTML = \`
-        <div class="cardTop">
-          <div>
-            <div class="title">Applied: \${escapeHtml(message.appliedOptionTitle)}</div>
-            <div class="summary">\${escapeHtml(message.appliedSummary || 'This implementation has been applied and this option set is now locked.')}</div>
+    function renderMetrics(option, status) {
+      const m = isRecord(option.measured) ? option.measured : {};
+      const mock = isRecord(option.metrics) ? option.metrics : {};
+      const tests = normalizeTests(m.tests);
+      const isPending = status === 'queued' || status === 'running';
+      const isFailed = status === 'failed' || status === 'error' || status === 'timeout';
+      const pendingLabel = status === 'queued' ? 'Queued' : 'Running...';
+      const routeCount = isRecord(m.metrics) ? m.metrics.endpoint_count : undefined;
+
+      let runVal = 'Not run';
+      if (typeof m.durationMs === 'number') runVal = Math.round(m.durationMs) + 'ms';
+      else if (isPending) runVal = pendingLabel;
+      else if (isFailed) runVal = 'Failed';
+      else if (mock.speed !== undefined) runVal = textOrEmpty(mock.speed) + ' (est)';
+
+      let testVal = 'Not run';
+      if (tests) testVal = tests.passed + '/' + tests.total + ' passed';
+      else if (isPending) testVal = pendingLabel;
+      else if (isFailed) testVal = 'Fail';
+      else if (mock.testConfidence !== undefined) testVal = textOrEmpty(mock.testConfidence) + '% (est)';
+
+      let memVal = 'Not run';
+      if (routeCount !== undefined && routeCount !== null) memVal = textOrEmpty(routeCount) + ' routes';
+      else if (m.memory !== undefined && m.memory !== null) memVal = textOrEmpty(m.memory);
+      else if (isPending) memVal = pendingLabel;
+      else if (isFailed) memVal = 'Check logs';
+      else if (mock.readability !== undefined) memVal = textOrEmpty(mock.readability) + ' (est)';
+
+      let runTitle = 'Runtime';
+      let testTitle = tests ? 'Tests (' + tests.passed + '/' + tests.total + ')' : 'Tests';
+      let memTitle = 'Mem';
+
+      let runPct = '0%';
+      if (typeof m.durationMs === 'number') runPct = '100%';
+      else if (status === 'queued') runPct = '12%';
+      else if (status === 'running') runPct = '40%';
+      else if (isFailed) runPct = '50%';
+      else if (mock.speed !== undefined) runPct = percent(mock.speed);
+
+      let testPct = '0%';
+      if (tests && tests.total > 0) testPct = percent((tests.passed / tests.total) * 100);
+      else if (status === 'queued') testPct = '12%';
+      else if (status === 'running') testPct = '48%';
+      else if (isFailed) testPct = '10%';
+      else if (mock.testConfidence !== undefined) testPct = percent(mock.testConfidence);
+
+      let memPct = '0%';
+      if (routeCount !== undefined && routeCount !== null) memPct = '100%';
+      else if (m.memory !== undefined && m.memory !== null) memPct = '80%';
+      else if (status === 'queued') memPct = '12%';
+      else if (status === 'running') memPct = '20%';
+      else if (isFailed) memPct = '100%';
+      else if (mock.readability !== undefined) memPct = percent(mock.readability);
+
+      const metrics = document.createElement('div');
+      metrics.className = 'metrics';
+      [
+        [runTitle, runPct, runVal],
+        [testTitle, testPct, testVal],
+        [memTitle, memPct, memVal]
+      ].forEach(([title, pct, value]) => {
+        const col = document.createElement('div');
+        col.className = 'metric-col';
+        const label = document.createElement('span');
+        label.className = 'metric-title';
+        label.textContent = String(title);
+        const barBg = document.createElement('div');
+        barBg.className = 'metric-bar-bg';
+        const barFg = document.createElement('div');
+        barFg.className = 'metric-bar-fg';
+        barFg.style.width = String(pct);
+        barBg.appendChild(barFg);
+        const val = document.createElement('span');
+        val.className = 'metric-val';
+        val.textContent = String(value);
+        col.appendChild(label);
+        col.appendChild(barBg);
+        col.appendChild(val);
+        metrics.appendChild(col);
+      });
+      return metrics;
+    }
+
+    function renderInlineDetails(option, status) {
+      const m = option.measured || {};
+      const tests = normalizeTests(m.tests);
+      const duration = typeof m.durationMs === 'number' ? Math.round(m.durationMs) + 'ms' : '--';
+      const testValue = tests ? \`\${tests.passed}/\${tests.total}\` : '--';
+      const memoryValue = m.memory ? escapeHtml(String(m.memory)) : '--';
+      const plan = escapeHtml(option.implementationPlan || 'No implementation plan returned.');
+      const tradeoffs = Array.isArray(option.tradeoffs) && option.tradeoffs.length
+        ? option.tradeoffs.map((item) => '<li>' + escapeHtml(item) + '</li>').join('')
+        : '<li>No tradeoffs returned.</li>';
+      const issues = collectIssues(m);
+      const issueHtml = issues.length
+        ? '<div class="detail-section"><div class="detail-section-title">Failures / Logs</div><ul class="detail-list issue-list">' + issues.map((item) => '<li>' + escapeHtml(item) + '</li>').join('') + '</ul></div>'
+        : '<div class="empty-detail">No failure logs for this option.</div>';
+
+      return \`
+        <div class="inline-details">
+          <div class="detail-grid">
+            <div class="detail-stat"><div class="detail-label">Duration</div><div class="detail-value">\${duration}</div></div>
+            <div class="detail-stat"><div class="detail-label">Tests</div><div class="detail-value">\${testValue}</div></div>
+            <div class="detail-stat"><div class="detail-label">Memory</div><div class="detail-value">\${memoryValue}</div></div>
           </div>
-          <span class="selectedBadge">Applied</span>
-        </div>\`;
-      wrap.appendChild(card);
-      return wrap;
+          <div class="detail-section">
+            <div class="detail-section-title">Plan</div>
+            <div>\${plan}</div>
+          </div>
+          <div class="detail-section">
+            <div class="detail-section-title">Tradeoffs</div>
+            <ul class="detail-list">\${tradeoffs}</ul>
+          </div>
+          \${status === 'failed' || status === 'error' || status === 'timeout' ? issueHtml : ''}
+        </div>
+      \`;
+    }
+
+    function collectIssues(measured) {
+      const issues = [];
+      for (const failure of measured.failures || []) {
+        const test = failure.test ? failure.test + ': ' : '';
+        issues.push(test + (failure.details || 'Test failed.'));
+      }
+      for (const error of measured.errors || []) {
+        issues.push(JSON.stringify(error));
+      }
+      return issues;
     }
 
     function escapeHtml(value) {
@@ -531,108 +1453,27 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 </html>`;
   }
 
-  private getDetailsHtml(webview: vscode.Webview, option: BenchOption, activeTab: "metrics" | "code"): string {
-    const nonce = createNonce();
-    const optionJson = JSON.stringify({
-      ...option,
-      generatedCode: extractDisplayCode(option.generatedCode)
-    }).replace(/</g, "\\u003c");
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${webview.cspSource}; script-src 'nonce-${nonce}';">
-<title>Bench Details</title>
-<style>
-  :root {
-    color-scheme: dark;
-    --panel: var(--vscode-editor-background);
-    --card: var(--vscode-input-background);
-    --border: var(--vscode-panel-border);
-    --text: var(--vscode-foreground);
-    --muted: var(--vscode-descriptionForeground);
-    --accent: #8b6bff;
-    --accent2: #19e3ff;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 16px; font-family: var(--vscode-font-family); color: var(--text); background: var(--panel); }
-  h1 { font-size: 18px; line-height: 1.25; margin: 0; }
-  .summary { color: var(--muted); margin-top: 6px; line-height: 1.45; }
-  .tabs { display: flex; gap: 6px; margin: 16px 0; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
-  button { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
-  button.active { color: #09090f; border-color: transparent; background: linear-gradient(120deg,var(--accent),var(--accent2)); font-weight: 700; }
-  .panel { display: none; }
-  .panel.active { display: block; }
-  .metric { display: grid; grid-template-columns: 140px 1fr 44px; gap: 10px; align-items: center; margin: 12px 0; }
-  .bar { height: 10px; background: color-mix(in srgb, var(--muted) 18%, transparent); border-radius: 999px; overflow: hidden; }
-  .bar span { display: block; height: 100%; background: linear-gradient(90deg,var(--accent),var(--accent2)); }
-  .card { border: 1px solid var(--border); border-radius: 8px; background: var(--card); padding: 12px; margin: 12px 0; }
-  pre { white-space: pre-wrap; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--vscode-textCodeBlock-background); padding: 12px; line-height: 1.45; }
-  ul { padding-left: 20px; }
-  li { margin: 6px 0; }
-</style>
-</head>
-<body>
-  <h1 id="title"></h1>
-  <div class="summary" id="summary"></div>
-  <div class="tabs">
-    <button id="metricsTab" data-tab="metrics">Metrics</button>
-    <button id="codeTab" data-tab="code">Code</button>
-    <button id="planTab" data-tab="plan">Plan</button>
-  </div>
-  <section id="metrics" class="panel"></section>
-  <section id="code" class="panel"><pre id="codeBlock"></pre></section>
-  <section id="plan" class="panel">
-    <div class="card"><strong>Implementation Plan</strong><p id="implementationPlan"></p></div>
-    <div class="card"><strong>Tradeoffs</strong><ul id="tradeoffs"></ul></div>
-  </section>
-  <script nonce="${nonce}">
-    const option = ${optionJson};
-    const activeTab = ${JSON.stringify(activeTab)};
-    document.getElementById('title').textContent = option.title;
-    document.getElementById('summary').textContent = option.summary;
-    document.getElementById('codeBlock').textContent = option.generatedCode || 'No generated code returned.';
-    document.getElementById('implementationPlan').textContent = option.implementationPlan || 'No plan returned.';
-    document.getElementById('tradeoffs').innerHTML = (option.tradeoffs || []).map((item) => '<li>' + escapeHtml(item) + '</li>').join('');
-    document.getElementById('metrics').innerHTML = Object.entries(option.metrics).map(([key, value]) => {
-      const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, (char) => char.toUpperCase());
-      return '<div class="metric"><strong>' + escapeHtml(label) + '</strong><div class="bar"><span style="width:' + value + '%"></span></div><span>' + value + '</span></div>';
-    }).join('') + '<div class="card">Mock metric source: these values are placeholders for the future Docker sandbox runner.</div>';
-
-    document.querySelector('.tabs').addEventListener('click', (event) => {
-      if (!(event.target instanceof HTMLElement)) return;
-      const tab = event.target.getAttribute('data-tab');
-      if (tab) activate(tab);
-    });
-    activate(activeTab);
-
-    function activate(tab) {
-      document.querySelectorAll('.panel').forEach((node) => node.classList.toggle('active', node.id === tab));
-      document.querySelectorAll('button[data-tab]').forEach((node) => node.classList.toggle('active', node.getAttribute('data-tab') === tab));
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
-    }
-  </script>
-</body>
-</html>`;
-  }
 }
 
 type WebviewMessage = {
-  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption" | "applySelected" | "rejectSelected";
+  type:
+    | "ready"
+    | "askFeature"
+    | "selectOption"
+    | "applySelected"
+    | "rejectPreview"
+    | "newFeatureChat"
+    | "testAll"
+    | "applyWinner";
   text?: string;
   optionId?: string;
-  messageId?: string;
 };
 
 type WebviewState = {
   messages: ChatMessage[];
   options: BenchOption[];
   selectedOptionId?: string;
+  runState?: BenchRunState;
   loading: boolean;
   notice?: string;
   error?: string;
@@ -655,6 +1496,226 @@ function getWorkspaceContext(): WorkspaceContext {
   };
 }
 
+function buildFastApiAuthFallbackSuggestions(featureRequest: string): BenchOption[] {
+  const slug = featureRequest.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 28) || "auth-endpoint";
+  return [
+    {
+      id: `${slug}-dependency`,
+      title: "Dependency-based bearer guard",
+      summary: "Use a FastAPI dependency to centralize bearer-token validation for protected routes.",
+      implementationPlan: "Define a reusable require_token dependency, attach it to /protected, and keep /health unauthenticated.",
+      tradeoffs: ["Easy to reuse across routes", "Adds one indirection for a tiny API"],
+      generatedCode: [
+        "from fastapi import Depends, FastAPI, Header, HTTPException",
+        "",
+        "",
+        "def require_token(authorization: str | None = Header(default=None)) -> None:",
+        "    if authorization is None:",
+        "        raise HTTPException(status_code=401, detail=\"Missing bearer token\")",
+        "    if authorization != \"Bearer test-token\":",
+        "        raise HTTPException(status_code=403, detail=\"Invalid bearer token\")",
+        "",
+        "",
+        "def create_app() -> FastAPI:",
+        "    app = FastAPI()",
+        "",
+        "    @app.get(\"/health\")",
+        "    def health():",
+        "        return {\"status\": \"ok\"}",
+        "",
+        "    @app.get(\"/protected\", dependencies=[Depends(require_token)])",
+        "    def protected():",
+        "        return {\"authenticated\": True, \"strategy\": \"dependency\"}",
+        "",
+        "    return app",
+        ""
+      ].join("\n"),
+      runStatus: "draft",
+      selected: false
+    },
+    {
+      id: `${slug}-inline`,
+      title: "Inline route validation",
+      summary: "Keep the authentication rule directly inside the protected endpoint.",
+      implementationPlan: "Read the Authorization header in /protected, branch on missing and invalid tokens, and return JSON for the valid token.",
+      tradeoffs: ["Very explicit", "Duplicates logic if more protected routes are added"],
+      generatedCode: [
+        "from fastapi import FastAPI, Header, HTTPException",
+        "",
+        "",
+        "def create_app() -> FastAPI:",
+        "    app = FastAPI()",
+        "",
+        "    @app.get(\"/health\")",
+        "    def health():",
+        "        return {\"status\": \"ok\"}",
+        "",
+        "    @app.get(\"/protected\")",
+        "    def protected(authorization: str | None = Header(default=None)):",
+        "        if authorization is None:",
+        "            raise HTTPException(status_code=401, detail=\"Missing bearer token\")",
+        "        if authorization != \"Bearer test-token\":",
+        "            raise HTTPException(status_code=403, detail=\"Invalid bearer token\")",
+        "        return {\"authenticated\": True, \"strategy\": \"inline\"}",
+        "",
+        "    return app",
+        ""
+      ].join("\n"),
+      runStatus: "draft",
+      selected: false
+    },
+    {
+      id: `${slug}-too-permissive`,
+      title: "Permissive header check",
+      summary: "A deliberately flawed option that proves the fixture catches wrong-token authorization bugs.",
+      implementationPlan: "Require the header to exist but skip token value validation, which should fail the wrong-token test.",
+      tradeoffs: ["Demonstrates failure evidence", "Not secure enough to ship"],
+      generatedCode: [
+        "from fastapi import FastAPI, Header, HTTPException",
+        "",
+        "",
+        "def create_app() -> FastAPI:",
+        "    app = FastAPI()",
+        "",
+        "    @app.get(\"/health\")",
+        "    def health():",
+        "        return {\"status\": \"ok\"}",
+        "",
+        "    @app.get(\"/protected\")",
+        "    def protected(authorization: str | None = Header(default=None)):",
+        "        if authorization is None:",
+        "            raise HTTPException(status_code=401, detail=\"Missing bearer token\")",
+        "        return {\"authenticated\": True, \"strategy\": \"too-permissive\"}",
+        "",
+        "    return app",
+        ""
+      ].join("\n"),
+      runStatus: "draft",
+      selected: false
+    }
+  ];
+}
+
+function buildPythonMergeFallbackSuggestions(featureRequest: string): BenchOption[] {
+  const slug = featureRequest.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 28) || "python-merge";
+  return [
+    {
+      id: `${slug}-readable`,
+      title: "Readable sorted merge",
+      summary: "Sort intervals by start point, then merge overlapping ranges in one explicit pass.",
+      implementationPlan: "Normalize empty input, sort by start/end, append non-overlapping ranges, and extend the current range when intervals overlap.",
+      tradeoffs: ["Easy to audit", "O(n log n) due to sorting"],
+      generatedCode: [
+        "def merge_intervals(intervals):",
+        "    if not intervals:",
+        "        return []",
+        "    ordered = sorted(intervals, key=lambda item: (item[0], item[1]))",
+        "    merged = []",
+        "    for start, end in ordered:",
+        "        if not merged or start > merged[-1][1]:",
+        "            merged.append([start, end])",
+        "        else:",
+        "            merged[-1][1] = max(merged[-1][1], end)",
+        "    return merged",
+        ""
+      ].join("\n"),
+      metrics: {
+        readability: 94,
+        simplicity: 91,
+        speed: 82,
+        memory: 88,
+        maintainability: 92,
+        testConfidence: 86
+      },
+      runStatus: "draft",
+      selected: false
+    },
+    {
+      id: `${slug}-fast`,
+      title: "Tuple copy merge",
+      summary: "Use local variables and tuple unpacking to keep the merge loop compact and quick.",
+      implementationPlan: "Sort a copied interval list, carry the active output interval, and mutate only the output copy.",
+      tradeoffs: ["Avoids mutating caller input", "Slightly denser than the readable version"],
+      generatedCode: [
+        "def merge_intervals(intervals):",
+        "    ordered = sorted(([start, end] for start, end in intervals), key=lambda item: item[0])",
+        "    if not ordered:",
+        "        return []",
+        "    merged = [ordered[0]]",
+        "    for start, end in ordered[1:]:",
+        "        current = merged[-1]",
+        "        if start <= current[1]:",
+        "            if end > current[1]:",
+        "                current[1] = end",
+        "        else:",
+        "            merged.append([start, end])",
+        "    return merged",
+        ""
+      ].join("\n"),
+      metrics: {
+        readability: 82,
+        simplicity: 80,
+        speed: 90,
+        memory: 84,
+        maintainability: 85,
+        testConfidence: 84
+      },
+      runStatus: "draft",
+      selected: false
+    },
+    {
+      id: `${slug}-edge-case-check`,
+      title: "Intentional edge-case miss",
+      summary: "A deliberately flawed candidate that demonstrates failure evidence and logs.",
+      implementationPlan: "Return the input unchanged so the Docker fixture can surface failing tests and compare outcomes.",
+      tradeoffs: ["Useful for proving result reporting", "Incorrect for overlapping intervals"],
+      generatedCode: [
+        "def merge_intervals(intervals):",
+        "    return intervals",
+        ""
+      ].join("\n"),
+      metrics: {
+        readability: 70,
+        simplicity: 96,
+        speed: 96,
+        memory: 92,
+        maintainability: 42,
+        testConfidence: 34
+      },
+      runStatus: "draft",
+      selected: false
+    }
+  ];
+}
+
+function buildDecisionMessage(decision: DecisionPayload): string {
+  const candidateLines = decision.candidates.map((candidate) => {
+    const tests = candidate.tests ? `${candidate.tests.passed}/${candidate.tests.total} tests` : "tests unavailable";
+    const duration = typeof candidate.duration_ms === "number" ? `${Math.round(candidate.duration_ms)}ms` : "duration unavailable";
+    return `${candidate.label}: ${candidate.status}, ${tests}, ${duration}`;
+  });
+  const winner = decision.winner_candidate_id ? ` Winner: ${decision.winner_candidate_id}.` : "";
+  return [
+    `Docker evaluation finished for run ${decision.run_id}.${winner}`,
+    decision.summary ?? "No summary returned by the daemon.",
+    `Decision Payload returned to the extension: ${candidateLines.join(" | ")}`
+  ].join(" ");
+}
+
+function buildDecisionLogEntry(decision: DecisionPayload): string {
+  const candidateLines = decision.candidates.map((candidate) => {
+    const tests = candidate.tests ? `${candidate.tests.passed}/${candidate.tests.total}` : "tests unavailable";
+    const duration = typeof candidate.duration_ms === "number" ? `${Math.round(candidate.duration_ms)}ms` : "duration unavailable";
+    return `${candidate.label}=${candidate.status} (${tests}, ${duration})`;
+  });
+  return [
+    `Docker fixture ${decision.fixture_id} completed.`,
+    decision.winner_candidate_id ? `Winner candidate: ${decision.winner_candidate_id}.` : "No winner candidate.",
+    decision.summary ?? "No summary.",
+    `Evidence: ${candidateLines.join("; ")}`
+  ].join(" ");
+}
+
 function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
   const slug = featureRequest.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 36) || "feature";
   return [
@@ -673,8 +1734,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 88,
         testConfidence: 76
       },
-      selected: false,
-      applyState: "idle"
+      runStatus: "draft",
+      selected: false
     },
     {
       id: `${slug}-modular`,
@@ -691,8 +1752,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 94,
         testConfidence: 83
       },
-      selected: false,
-      applyState: "idle"
+      runStatus: "draft",
+      selected: false
     },
     {
       id: `${slug}-fast`,
@@ -709,33 +1770,10 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 79,
         testConfidence: 71
       },
-      selected: false,
-      applyState: "idle"
+      runStatus: "draft",
+      selected: false
     }
   ];
-}
-
-function cloneOptions(options: BenchOption[]): BenchOption[] {
-  return options.map((option) => ({
-    ...option,
-    metrics: { ...option.metrics },
-    tradeoffs: [...option.tradeoffs]
-  }));
-}
-
-function buildSessionId(messageId: string, optionId: string): string {
-  return `${messageId}::${optionId}`;
-}
-
-function parseSessionId(sessionId: string): { messageId: string; optionId: string } | undefined {
-  const separatorIndex = sessionId.indexOf("::");
-  if (separatorIndex === -1) {
-    return undefined;
-  }
-  return {
-    messageId: sessionId.slice(0, separatorIndex),
-    optionId: sessionId.slice(separatorIndex + 2)
-  };
 }
 
 function createId(prefix: string): string {
@@ -754,57 +1792,3 @@ function createNonce(): string {
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-function extractDisplayCode(generatedCode: string): string {
-  const headingMatches = [...generatedCode.matchAll(/(?:^|\n)###\s+[^\n]+\n```[^\n]*\n([\s\S]*?)```/g)];
-  if (headingMatches.length) {
-    return headingMatches.map((match) => trimTrailingNewline(match[1] ?? "")).filter(Boolean).join("\n\n");
-  }
-
-  const labeledMatches = [...generatedCode.matchAll(/(?:^|\n)(?:File|Path):\s*[^\n]+\n```[^\n]*\n([\s\S]*?)```/g)];
-  if (labeledMatches.length) {
-    return labeledMatches.map((match) => trimTrailingNewline(match[1] ?? "")).filter(Boolean).join("\n\n");
-  }
-
-  const unfencedSections = extractUnfencedDisplaySections(generatedCode);
-  if (unfencedSections.length) {
-    return unfencedSections.join("\n\n");
-  }
-
-  const fencedMatch = generatedCode.match(/```[^\n`]*\n([\s\S]*?)```/);
-  if (fencedMatch?.[1]) {
-    return trimTrailingNewline(fencedMatch[1]);
-  }
-
-  return generatedCode.trim();
-}
-
-function extractUnfencedDisplaySections(generatedCode: string): string[] {
-  const headingPattern = /(?:^|\n)###\s+([^\n]+)\n/g;
-  const matches = [...generatedCode.matchAll(headingPattern)];
-  if (!matches.length) {
-    return [];
-  }
-
-  const sections: string[] = [];
-  for (let index = 0; index < matches.length; index += 1) {
-    const bodyStart = (matches[index].index ?? 0) + matches[index][0].length;
-    const nextStart = matches[index + 1]?.index ?? generatedCode.length;
-    const lines = generatedCode.slice(bodyStart, nextStart).trim().split(/\r?\n/);
-    if (/^(python|typescript|javascript|tsx|jsx|json|markdown|yaml|toml)$/i.test(lines[0]?.trim() ?? "")) {
-      lines.shift();
-    }
-    const section = trimTrailingNewline(lines.join("\n"));
-    if (section) {
-      sections.push(section);
-    }
-  }
-  return sections;
-}
-
-function trimTrailingNewline(value: string): string {
-  return value.replace(/\n+$/u, "");
-}
-
-
-

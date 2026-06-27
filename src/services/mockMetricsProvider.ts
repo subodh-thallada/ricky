@@ -13,6 +13,7 @@ export class MockMetricsProvider implements MetricsProvider {
   attachMetrics(suggestions: BenchSuggestion[]): BenchOption[] {
     return suggestions.map((suggestion, index) => ({
       ...suggestion,
+      runStatus: "draft",
       selected: false,
       applyState: "idle",
       metrics: this.buildMetrics(suggestion, index)

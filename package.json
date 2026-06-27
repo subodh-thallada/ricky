@@ -20,10 +20,15 @@
                         "configuration":  {
                                               "title":  "Bench",
                                               "properties":  {
-                                                                 "bench.orchestratorUrl":  {
+                                                                "bench.orchestratorUrl":  {
                                                                                                "type":  "string",
                                                                                                "default":  "http://127.0.0.1:8000",
                                                                                                "description":  "Local Bench orchestrator URL used by the VS Code extension."
+                                                                                           },
+                                                                 "bench.daemonUrl":  {
+                                                                                               "type":  "string",
+                                                                                               "default":  "http://127.0.0.1:8001",
+                                                                                               "description":  "Local Bench daemon URL used for Docker candidate evaluation."
                                                                                            }
                                                              }
                                           },

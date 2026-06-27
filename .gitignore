@@ -12,5 +12,8 @@ __pycache__/
 *.egg-info/
 .bench_threads.json
 .bench_repo_context_cache.json
-node_modules/
-dist/
+.bench-logs/
+.codex/
+.gemini/
+.stitch-mcp/
+stitch_site/
