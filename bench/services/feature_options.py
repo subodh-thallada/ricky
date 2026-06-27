@@ -42,37 +42,6 @@ class FeatureOptionsService:
                 options=[option.model_dump(by_alias=True) for option in suggestions],
             )
 
-        system_prompt = (
-            "You are Bench, a VS Code coding assistant.\n"
-            "Given a user's feature request and optional editor context, return up to 3 genuinely different implementation options.\n"
-            "If there is one clear best implementation and the alternatives would be low-value or artificial, returning just 1 option is allowed.\n"
-            "Prefer multiple options only when they reflect real design choices the user may want to compare.\n"
-            "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
-            "Bench UI contract:\n"
-            "- title: short and distinct.\n"
-            "- summary: one brief sentence focused on what makes this option meaningfully different from the other correct options.\n"
-            "- implementationPlan: 2 to 4 sentences with enough detail for the View Details panel.\n"
-            "- tradeoffs: 2 to 4 crisp bullets, including both upsides and downsides.\n"
-            "- generatedCode: production-style code, not pseudocode.\n"
-            "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
-            "### relative/path.ext\n```language\n...code...\n```\n"
-            "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
-            "Placement rules for generatedCode:\n"
-            "- Prefer one focused file when possible so Bench can preview inline.\n"
-            "- If a focused file or active file already appears to contain the target function/class/placeholder, align the code to that file and that symbol.\n"
-            "- If you define a function or class, use the real intended symbol name so Bench can match and replace the correct block locally.\n"
-            "- If you are changing a stub, replace the stub with the final implementation instead of returning surrounding commentary.\n"
-            "- Do not include explanations inside generatedCode.\n"
-            "- Keep imports and helper functions that are actually needed by the implementation.\n"
-            "Option design rules:\n"
-            "- All options should be correct, but each should reflect a real design choice the user may want to compare.\n"
-            "- Avoid returning trivial variants that only rename variables or reorder code.\n"
-            "- Make the differences legible at the card-summary level and concrete in the plan/tradeoffs.\n"
-            "- Return at most 3 options.\n"
-            "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
-            'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
-            '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
-        )
         user_payload = {
             "featureRequest": prompt,
             "workspaceContext": {
@@ -95,15 +64,7 @@ class FeatureOptionsService:
                 "preferFocusedSingleFile": True,
             },
         }
-        response = await self.cerebras.chat(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload)},
-            ],
-            max_completion_tokens=2200,
-            temperature=0.35,
-        )
-        suggestions = _parse_options(response.text or "")
+        response, suggestions = await self._generate_real_suggestions(user_payload)
         return FeatureOptionsResponse(
             assistant_message=_build_assistant_message(len(suggestions)),
             context_summary=context_summary,
@@ -113,9 +74,36 @@ class FeatureOptionsService:
             options=[option.model_dump(by_alias=True) for option in suggestions],
         )
 
+    async def _generate_real_suggestions(
+        self,
+        user_payload: dict[str, object],
+    ) -> tuple[object, list[FeatureOption]]:
+        response = await self.cerebras.chat(
+            [
+                {"role": "system", "content": _build_system_prompt(require_min_options=2, strict=False)},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+            max_completion_tokens=2200,
+            temperature=0.35,
+        )
+        suggestions = _parse_options(response.text or "")
+        if len(suggestions) >= 2:
+            return response, suggestions
+
+        retry_response = await self.cerebras.chat(
+            [
+                {"role": "system", "content": _build_system_prompt(require_min_options=2, strict=True)},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+            max_completion_tokens=2600,
+            temperature=0.45,
+        )
+        retry_suggestions = _parse_options(retry_response.text or "")
+        return retry_response, retry_suggestions
+
 
 def _parse_options(content: str) -> list[FeatureOption]:
-    cleaned = content.replace("```json", "").replace("```", "").strip()
+    cleaned = _strip_outer_json_fence(content)
     payload = json.loads(cleaned)
     raw_suggestions = payload.get("suggestions", [])
     if not isinstance(raw_suggestions, list):
@@ -147,6 +135,55 @@ def _parse_options(content: str) -> list[FeatureOption]:
     if not options:
         raise ValueError("Cerebras returned no usable implementation options.")
     return options
+
+
+def _strip_outer_json_fence(content: str) -> str:
+    cleaned = content.strip()
+    match = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return cleaned
+
+
+def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
+    option_requirement = (
+        f"Given a user's feature request and optional editor context, return at least {require_min_options} and at most 3 genuinely different implementation options.\n"
+    )
+    strict_requirement = (
+        "Do not return just 1 option. If the solution space is narrow, still provide at least 2 materially different correct implementations with clear tradeoffs.\n"
+        if strict
+        else "Prefer multiple options when they reflect real design choices the user may want to compare.\n"
+    )
+    return (
+        "You are Bench, a VS Code coding assistant.\n"
+        f"{option_requirement}"
+        f"{strict_requirement}"
+        "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
+        "Bench UI contract:\n"
+        "- title: short and distinct.\n"
+        "- summary: one brief sentence focused on what makes this option meaningfully different from the other correct options.\n"
+        "- implementationPlan: 2 to 4 sentences with enough detail for the View Details panel.\n"
+        "- tradeoffs: 2 to 4 crisp bullets, including both upsides and downsides.\n"
+        "- generatedCode: production-style code, not pseudocode.\n"
+        "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
+        "### relative/path.ext\n```language\n...code...\n```\n"
+        "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
+        "Placement rules for generatedCode:\n"
+        "- Prefer one focused file when possible so Bench can preview inline.\n"
+        "- If a focused file or active file already appears to contain the target function/class/placeholder, align the code to that file and that symbol.\n"
+        "- If you define a function or class, use the real intended symbol name so Bench can match and replace the correct block locally.\n"
+        "- If you are changing a stub, replace the stub with the final implementation instead of returning surrounding commentary.\n"
+        "- Do not include explanations inside generatedCode.\n"
+        "- Keep imports and helper functions that are actually needed by the implementation.\n"
+        "Option design rules:\n"
+        "- All options should be correct, but each should reflect a real design choice the user may want to compare.\n"
+        "- Avoid returning trivial variants that only rename variables or reorder code.\n"
+        "- Make the differences legible at the card-summary level and concrete in the plan/tradeoffs.\n"
+        "- Return at most 3 options.\n"
+        "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
+        'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
+        '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
+    )
 
 
 def _build_metrics(title: str, summary: str, index: int) -> BenchMetricSet:

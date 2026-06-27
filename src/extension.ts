@@ -533,7 +533,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
   private getDetailsHtml(webview: vscode.Webview, option: BenchOption, activeTab: "metrics" | "code"): string {
     const nonce = createNonce();
-    const optionJson = JSON.stringify(option).replace(/</g, "\\u003c");
+    const optionJson = JSON.stringify({
+      ...option,
+      generatedCode: extractDisplayCode(option.generatedCode)
+    }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -750,6 +753,29 @@ function createNonce(): string {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function extractDisplayCode(generatedCode: string): string {
+  const headingMatch = generatedCode.match(/(?:^|\n)###\s+[^\n]+\n```[^\n]*\n([\s\S]*?)```/);
+  if (headingMatch?.[1]) {
+    return trimTrailingNewline(headingMatch[1]);
+  }
+
+  const labeledMatch = generatedCode.match(/(?:^|\n)(?:File|Path):\s*[^\n]+\n```[^\n]*\n([\s\S]*?)```/);
+  if (labeledMatch?.[1]) {
+    return trimTrailingNewline(labeledMatch[1]);
+  }
+
+  const fencedMatch = generatedCode.match(/```[^\n`]*\n([\s\S]*?)```/);
+  if (fencedMatch?.[1]) {
+    return trimTrailingNewline(fencedMatch[1]);
+  }
+
+  return generatedCode.trim();
+}
+
+function trimTrailingNewline(value: string): string {
+  return value.replace(/\n+$/u, "");
 }
 
 

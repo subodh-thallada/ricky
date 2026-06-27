@@ -85,10 +85,7 @@ export class CerebrasClient {
 }
 
 function parseSuggestions(content: string): BenchSuggestion[] {
-  const cleaned = content
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/i, "")
-    .trim();
+  const cleaned = stripOuterJsonFence(content);
 
   const parsed = JSON.parse(cleaned) as { suggestions?: unknown };
   if (!Array.isArray(parsed.suggestions)) {
@@ -118,4 +115,13 @@ function normalizeSuggestions(suggestions: BenchSuggestion[]): BenchSuggestion[]
     ...suggestion,
     id: suggestion.id || `option-${index + 1}`
   }));
+}
+
+function stripOuterJsonFence(content: string): string {
+  const cleaned = content.trim();
+  const match = cleaned.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (match?.[1]) {
+    return match[1].trim();
+  }
+  return cleaned;
 }
