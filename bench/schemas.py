@@ -6,6 +6,13 @@ class ConversationMessage(BaseModel):
     content: str = Field(min_length=1)
 
 
+class ChatItem(BaseModel):
+    kind: str
+    content: str
+    language: str | None = None
+    title: str | None = None
+
+
 class RepoContextConfig(BaseModel):
     root_path: str = "."
     include_extensions: list[str] = Field(
@@ -65,6 +72,13 @@ class ThreadMessageCreateRequest(BaseModel):
     content: str = Field(min_length=1)
 
 
+class ThreadReplyRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    repo_context: RepoContextConfig | None = None
+    intent_hint: str = "auto"
+    language: str = "python"
+
+
 class ThreadBenchPreviewRequest(BaseModel):
     function_name: str
     language: str = "python"
@@ -79,3 +93,13 @@ class StoredThread(BaseModel):
     title: str | None = None
     messages: list[ConversationMessage] = Field(default_factory=list)
     repo_context: RepoContextConfig | None = None
+
+
+class RoutedReplyResponse(BaseModel):
+    thread_id: str
+    provider: str
+    model: str
+    mode: str
+    items: list[ChatItem]
+    raw_text: str
+    context_summary: dict[str, object]

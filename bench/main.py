@@ -8,13 +8,17 @@ from bench.schemas import (
     BenchRunPreviewResponse,
     BenchRunRequest,
     ConversationMessage,
+    RoutedReplyResponse,
     StoredThread,
     ThreadBenchPreviewRequest,
     ThreadCreateRequest,
     ThreadMessageCreateRequest,
+    ThreadReplyRequest,
 )
 from bench.services.bench_preview import BenchPreviewService
+from bench.services.chat_router import ChatRouter
 from bench.services.thread_store import ThreadStore
+from bench.services.thread_chat import ThreadChatService
 
 app = FastAPI(title="Bench Orchestrator")
 thread_store = ThreadStore()
@@ -87,6 +91,41 @@ async def append_thread_message(
         thread_id,
         ConversationMessage(role=request.role, content=request.content),
     )
+
+
+@app.post("/threads/{thread_id}/reply", response_model=RoutedReplyResponse)
+async def reply_in_thread(
+    thread_id: str,
+    request: ThreadReplyRequest,
+) -> RoutedReplyResponse:
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="thread_not_found")
+
+    if request.repo_context is not None:
+        thread = thread_store.update_repo_context(thread_id, request.repo_context)
+
+    prior_history = list(thread.messages)
+    thread = thread_store.append_message(
+        thread_id,
+        ConversationMessage(role="user", content=request.prompt),
+    )
+
+    settings = get_settings()
+    service = ThreadChatService(ChatRouter(settings))
+    response = await service.reply(
+        thread_id=thread_id,
+        history=prior_history,
+        prompt=request.prompt,
+        repo_context=thread.repo_context,
+        intent_hint=request.intent_hint,
+        language=request.language,
+    )
+    thread_store.append_message(
+        thread_id,
+        ConversationMessage(role="assistant", content=response.raw_text),
+    )
+    return response
 
 
 @app.post("/threads/{thread_id}/bench-preview", response_model=BenchRunPreviewResponse)
