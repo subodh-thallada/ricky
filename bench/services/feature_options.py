@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
 from bench.schemas import (
     BenchMetricSet,
@@ -16,8 +17,9 @@ from bench.services.repo_context import build_repo_context
 
 
 class FeatureOptionsService:
-    def __init__(self, cerebras: CerebrasClient):
+    def __init__(self, cerebras: CerebrasClient, memory: BackboardAdapter | None = None):
         self.cerebras = cerebras
+        self.memory = memory
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
         prompt = _strip_provider_keywords(request.prompt)
@@ -32,9 +34,11 @@ class FeatureOptionsService:
             inferred_context = _expand_repo_context_for_real_mode(inferred_context)
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
+        recalled_memories = await self._recall_memories(request, prompt, context_metadata)
 
         if not real_mode:
             suggestions = _parse_options(_build_test_response_text(prompt))
+            memory_result = await self._remember_feature_turn(request, prompt, suggestions, context_metadata)
             return FeatureOptionsResponse(
                 assistant_message=_build_assistant_message(len(suggestions)),
                 context_summary=context_summary,
@@ -42,6 +46,8 @@ class FeatureOptionsService:
                 gemini_model="disabled-cerebras-only",
                 cerebras_model="cerebras-test-stub",
                 options=[option.model_dump(by_alias=True) for option in suggestions],
+                backboard_thread_id=memory_result.get("thread_id"),
+                backboard_assistant_id=memory_result.get("assistant_id"),
             )
 
         user_payload = {
@@ -53,6 +59,7 @@ class FeatureOptionsService:
                 "visibleText": _sanitize_test_markers(request.visible_text) if real_mode else request.visible_text,
             },
             "repositoryContext": _sanitize_test_markers(repo_snapshot) if real_mode else repo_snapshot,
+            "backboardMemory": recalled_memories,
             "benchContext": {
                 "currentUi": {
                     "cards_show": ["title", "summary"],
@@ -67,6 +74,7 @@ class FeatureOptionsService:
             },
         }
         response, suggestions = await self._generate_real_suggestions(user_payload)
+        memory_result = await self._remember_feature_turn(request, prompt, suggestions, context_metadata)
         return FeatureOptionsResponse(
             assistant_message=_build_assistant_message(len(suggestions)),
             context_summary=context_summary,
@@ -74,7 +82,53 @@ class FeatureOptionsService:
             gemini_model="disabled-cerebras-only",
             cerebras_model=response.model,
             options=[option.model_dump(by_alias=True) for option in suggestions],
+            backboard_thread_id=memory_result.get("thread_id"),
+            backboard_assistant_id=memory_result.get("assistant_id"),
         )
+
+    async def _recall_memories(
+        self,
+        request: FeatureOptionsRequest,
+        prompt: str,
+        context_metadata: dict[str, object],
+    ) -> list[str]:
+        if self.memory is None:
+            return []
+        try:
+            memories = await self.memory.recall(
+                assistant_id=request.backboard_assistant_id,
+                query=prompt,
+            )
+        except Exception as exc:  # pragma: no cover - network and SDK surface vary
+            context_metadata["backboard_memory_recall_error"] = str(exc)
+            return []
+        context_metadata["backboard_memories_recalled"] = len(memories)
+        return memories
+
+    async def _remember_feature_turn(
+        self,
+        request: FeatureOptionsRequest,
+        prompt: str,
+        suggestions: list[FeatureOption],
+        context_metadata: dict[str, object],
+    ) -> dict[str, str | None]:
+        if self.memory is None:
+            return {"thread_id": request.backboard_thread_id, "assistant_id": request.backboard_assistant_id}
+        try:
+            result = await self.memory.remember(
+                _build_backboard_memory_content(prompt, suggestions),
+                thread_id=request.backboard_thread_id,
+                assistant_id=request.backboard_assistant_id,
+                metadata={"kind": "feature_options_turn", "option_count": len(suggestions)},
+            )
+        except Exception as exc:  # pragma: no cover - network and SDK surface vary
+            context_metadata["backboard_memory_error"] = str(exc)
+            return {"thread_id": request.backboard_thread_id, "assistant_id": request.backboard_assistant_id}
+        context_metadata["backboard_memory_status"] = result.get("status", "unknown")
+        return {
+            "thread_id": result.get("thread_id") or request.backboard_thread_id,
+            "assistant_id": result.get("assistant_id") or request.backboard_assistant_id,
+        }
 
     async def _generate_real_suggestions(
         self,
@@ -384,6 +438,16 @@ def _sanitize_test_markers(value: str | None) -> str | None:
     if value is None:
         return None
     return value.replace("(TEST)", "").replace("(test)", "")
+
+
+def _build_backboard_memory_content(prompt: str, suggestions: list[FeatureOption]) -> str:
+    lines = [
+        "Bench chat memory update.",
+        f"User request: {prompt}",
+        "Generated options:",
+    ]
+    lines.extend(f"- {option.title}: {option.summary}" for option in suggestions[:3])
+    return "\n".join(lines)
 
 
 def _build_test_response_text(prompt: str) -> str:

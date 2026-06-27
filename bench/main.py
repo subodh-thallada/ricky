@@ -51,7 +51,7 @@ async def providers_check() -> dict[str, object]:
 @app.post("/feature-options", response_model=FeatureOptionsResponse)
 async def feature_options(request: FeatureOptionsRequest) -> FeatureOptionsResponse:
     settings = get_settings()
-    service = FeatureOptionsService(CerebrasClient(settings))
+    service = FeatureOptionsService(CerebrasClient(settings), BackboardAdapter(settings))
     return await service.generate(request)
 
 
@@ -140,11 +140,19 @@ async def reply_in_thread(
         repo_context=thread.repo_context,
         intent_hint=request.intent_hint,
         language=request.language,
+        backboard_thread_id=thread.backboard_thread_id,
+        backboard_assistant_id=thread.backboard_assistant_id,
     )
     thread_store.append_message(
         thread_id,
         ConversationMessage(role="assistant", content=response.raw_text),
     )
+    if response.backboard_thread_id or response.backboard_assistant_id:
+        thread_store.update_backboard_ids(
+            thread_id,
+            backboard_thread_id=response.backboard_thread_id,
+            backboard_assistant_id=response.backboard_assistant_id,
+        )
     return response
 
 

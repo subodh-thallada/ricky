@@ -9,10 +9,17 @@ export type FeatureOptionsResponse = {
   geminiModel?: unknown;
   cerebrasModel?: unknown;
   options?: unknown[];
+  backboardThreadId?: unknown;
+  backboardAssistantId?: unknown;
+};
+
+export type BackboardMemoryIds = {
+  threadId?: string;
+  assistantId?: string;
 };
 
 export class OrchestratorClient {
-  async generateFeatureOptions(prompt: string, workspaceContext: WorkspaceContext): Promise<{ message: string; options: BenchOption[]; contextSummary: string }> {
+  async generateFeatureOptions(prompt: string, workspaceContext: WorkspaceContext, backboardMemory: BackboardMemoryIds = {}): Promise<{ message: string; options: BenchOption[]; contextSummary: string; backboardMemory: BackboardMemoryIds }> {
     const baseUrl = vscode.workspace.getConfiguration("bench").get<string>("orchestratorUrl")?.replace(/\/$/, "") || "http://127.0.0.1:8000";
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
     const activeRelativePath = workspaceContext.activeFileName && workspaceRoot
@@ -36,6 +43,8 @@ export class OrchestratorClient {
         active_file_name: activeRelativePath,
         selected_text: workspaceContext.selectedText,
         visible_text: workspaceContext.visibleText,
+        backboard_thread_id: backboardMemory.threadId,
+        backboard_assistant_id: backboardMemory.assistantId,
         repo_context: workspaceRoot
           ? {
               root_path: workspaceRoot.uri.fsPath,
@@ -56,7 +65,11 @@ export class OrchestratorClient {
     return {
       message: textField(payload.assistantMessage),
       contextSummary: textField(payload.contextSummary),
-      options: rawOptions.map(normalizeOption)
+      options: rawOptions.map(normalizeOption),
+      backboardMemory: {
+        threadId: textField(payload.backboardThreadId) || backboardMemory.threadId,
+        assistantId: textField(payload.backboardAssistantId) || backboardMemory.assistantId
+      }
     };
   }
 }

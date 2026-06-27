@@ -78,3 +78,17 @@ class ThreadStore:
             thread.repo_context = repo_context
             self._save()
             return thread
+
+    def update_backboard_ids(
+        self,
+        thread_id: str,
+        *,
+        backboard_thread_id: str | None,
+        backboard_assistant_id: str | None,
+    ) -> StoredThread:
+        with self._lock:
+            thread = self._threads[thread_id]
+            thread.backboard_thread_id = backboard_thread_id or thread.backboard_thread_id
+            thread.backboard_assistant_id = backboard_assistant_id or thread.backboard_assistant_id
+            self._save()
+            return thread

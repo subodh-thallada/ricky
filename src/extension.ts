@@ -47,6 +47,8 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   private currentRunAbort?: AbortController;
   private lastPrompt = "";
   private decisionLog: string[] = [];
+  private backboardThreadId?: string;
+  private backboardAssistantId?: string;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -103,6 +105,8 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     this.selectedOptionId = undefined;
     this.runState = undefined;
     this.decisionLog = [];
+    this.backboardThreadId = undefined;
+    this.backboardAssistantId = undefined;
     this.currentRunAbort?.abort();
     this.currentRunAbort = undefined;
     this.postState();
@@ -121,7 +125,13 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     try {
       const workspaceContext = getWorkspaceContext();
-      const result = await this.orchestrator.generateFeatureOptions(this.promptWithDecisionContext(prompt), workspaceContext);
+      const result = await this.orchestrator.generateFeatureOptions(
+        this.promptWithDecisionContext(prompt),
+        workspaceContext,
+        { threadId: this.backboardThreadId, assistantId: this.backboardAssistantId }
+      );
+      this.backboardThreadId = result.backboardMemory.threadId;
+      this.backboardAssistantId = result.backboardMemory.assistantId;
       this.options = result.options;
       this.selectedOptionId = undefined;
       this.messages.push({

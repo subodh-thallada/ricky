@@ -61,6 +61,8 @@ class FeatureOptionsRequest(BaseModel):
     selected_text: str | None = None
     visible_text: str | None = None
     repo_context: RepoContextConfig | None = None
+    backboard_thread_id: str | None = None
+    backboard_assistant_id: str | None = None
 
 
 class BenchMetricSet(BaseModel):
@@ -101,6 +103,8 @@ class FeatureOptionsResponse(BaseModel):
     gemini_model: str = Field(alias="geminiModel")
     cerebras_model: str = Field(alias="cerebrasModel")
     options: list[FeatureOption]
+    backboard_thread_id: str | None = Field(default=None, alias="backboardThreadId")
+    backboard_assistant_id: str | None = Field(default=None, alias="backboardAssistantId")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -187,6 +191,8 @@ class StoredThread(BaseModel):
     title: str | None = None
     messages: list[ConversationMessage] = Field(default_factory=list)
     repo_context: RepoContextConfig | None = None
+    backboard_thread_id: str | None = None
+    backboard_assistant_id: str | None = None
 
 
 class RoutedReplyResponse(BaseModel):
@@ -197,3 +203,5 @@ class RoutedReplyResponse(BaseModel):
     items: list[ChatItem]
     raw_text: str
     context_summary: dict[str, object]
+    backboard_thread_id: str | None = None
+    backboard_assistant_id: str | None = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
 from bench.config import Settings
 
@@ -25,6 +26,7 @@ CODE_HINTS = {
 class ChatRouter:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.backboard = BackboardAdapter(settings)
         self.cerebras = CerebrasClient(settings)
 
     def detect_mode(self, prompt: str, *, intent_hint: str = "auto") -> str:
