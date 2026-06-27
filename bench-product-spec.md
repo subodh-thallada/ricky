@@ -1,26 +1,26 @@
 # Bench — Product Spec
 
-**The trust-but-verify layer for agentic coding.**
-Point it at what your AI agent just wrote; get the measured best-of-4 back.
+**The VS Code trust-but-verify layer for agentic coding.**
+Chat with Bench in your editor, test every proposed approach in parallel sandboxes, and apply the measured winner.
 
-> Status: Hackathon v1 (weekend build) · Last updated: 2026-06-26
-> Stack of record: **Cerebras** (parallel generation) · **Docker** (isolated measurement) · **Backboard** (persistent taste)
-> Sits on top of: your AI coding agent — **Claude Code**, **Pi**, Cursor, Aider, or a human
+> Status: Hackathon v1 (weekend build) · Last updated: 2026-06-27
+> Stack of record: **VS Code extension** (editor surface) · **Cerebras** (parallel generation) · **Docker** (isolated measurement) · **Backboard** (persistent taste)
+> Sits on top of: VS Code + your AI coding agent — **Claude Code**, **Pi**, Cursor, Aider, or a human
 > Audience: build team + judges
 
 ---
 
 ## 1. The pitch (read this first)
 
-You're already shipping with an AI coding agent — Claude Code, Pi, whatever. It writes the function. Or it offers you "a few options." Either way it hands you an answer and says *trust me*: no evidence, no measured alternatives, no memory of what you actually prefer. You either accept on faith or burn an afternoon checking it yourself across three terminal tabs.
+You're already shipping with an AI coding agent inside your editor — Claude Code, Pi, Cursor, whatever. It writes the function. Or it offers you "three ways we could do this." Either way it hands you options and says *trust me*: no evidence, no measured alternatives, no memory of what you actually prefer. You either accept on faith or burn an afternoon checking it yourself across three terminal tabs.
 
-**Bench runs on *that*.** Point it at whatever your agent just produced and in ~4 seconds it gives you the **best possible 4 options, measured** — the agent's own version *plus* genuinely-different alternatives, each run in an isolated sandbox with real numbers: runtime, memory, lines, dependencies, which edge cases pass. You pick. Bench learns your taste. And it hands the chosen implementation straight back to the agent, so it keeps building with the **verified** choice.
+**Bench is the sidecar for that moment.** It lives as a VS Code side panel: a Cursor-style chat on top, structured approach cards when there are multiple paths, and a sandbox peek rail that lets you inspect the background runs without leaving the editor. In ~4 seconds it gives you the **best possible 4 options, measured** — the agent's own version *plus* genuinely-different alternatives, each run in an isolated sandbox with real numbers: runtime, memory, lines, dependencies, which edge cases pass. You pick. Bench learns your taste. And it applies the chosen implementation back into the workspace, so the agent keeps building with the **verified** choice.
 
 It doesn't replace your agent. It's the half today's tools skip: **the verify half.**
 
 ### Why it's not "another agent that writes tests and loops till green" — and not a Claude Code competitor
 
-That pattern just makes the *old* thing (writing code) faster. Bench doesn't try to out-write your agent — it **sits above it**. The agent generates; Bench turns that single "trust me" into a side-by-side, evidence-backed **option space** and a decision you can defend. It's a tool with a point of view about its user: it treats the developer as the decision-maker, it's honest (every "X is faster" is an actual measured run, not a hallucinated claim), and it has the taste to **stay quiet** when the agent's answer has no real alternative.
+That pattern just makes the *old* thing (writing code) faster. Bench doesn't try to out-write your agent — it **sits beside it in the IDE**. The agent generates; Bench turns that single "trust me" into a side-by-side, evidence-backed **option space** and a decision you can defend. It's a tool with a point of view about its user: it treats the developer as the decision-maker, it's honest (every "X is faster" is an actual measured run, not a hallucinated claim), and it has the taste to **stay quiet** when the agent's answer has no real alternative.
 
 ### Why all three sponsor tools are load-bearing (not bolted on)
 
@@ -28,22 +28,22 @@ That pattern just makes the *old* thing (writing code) faster. Bench doesn't try
 |---|---|---|
 | **Cerebras** | The reason it can exist. Benching an agent's output means generating the alternatives + reasoning passes *inside the dev's flow*. At ~50–200 tok/s that's minutes — nobody waits. At **1,800–2,000+ tok/s in parallel** it's a few seconds, so it can fire on every meaningful function the agent writes. Speed makes a *new kind of tool* usable. | …the loop is too slow to ever fire. Back to one "trust me." |
 | **Docker** | The evidence. You can't say "the heap variant beats Claude's by 2×, the clever one fails on `[]`" unless you actually run them, isolated and measured. N ephemeral sandboxes are the proof. | …you're back to vibes / hallucinated benchmarks. |
-| **Backboard** | Your team's taste, persisted. The board learns picks across repos ("we prefer readable over clever; we avoid new deps") and pre-ranks the agent's output to that. | …no learning, no judgment handoff. Juniors don't inherit the team's taste. |
+| **Backboard** | Your team's taste, persisted. The extension learns picks across repos ("we prefer readable over clever; we avoid new deps") and pre-ranks the agent's output to that. | …no learning, no judgment handoff. Juniors don't inherit the team's taste. |
 
 ---
 
 ## 2. The demo moment (90 seconds)
 
-1. You're building a feature with **Claude Code**. It writes `merge_intervals` and moves on.
-2. Before you accept, Bench fires — a **PostToolUse hook**, or you type `/bench`.
-3. In **~4 seconds** a board appears: **Claude's version** sits alongside 3 genuinely-different alternatives, all sandboxed and measured. Each has a **green/red test badge** and live numbers (runtime on 10k inputs, peak memory, LOC, deps).
-4. The spread tells the story: Claude's is clean and correct — but a **brute-force** variant is 18× slower, a **heap** one is heavier for no gain, and a **clever stack** version (the kind an agent loves to write) actually **fails on `[]`** with the exact input shown.
-5. You pick the clean one. Bench **hands it back to Claude Code**, which keeps building with the verified choice — and remembers you lead with readability next time.
-6. Run a **second** function. The board is already ordered to your taste.
+1. You're building a feature in **VS Code** with an AI coding agent. The agent proposes three approaches for `merge_intervals`.
+2. In the Bench side panel, those approaches appear as **structured approach cards**: `Readable`, `Fast`, `Low memory`, each with rationale, expected tradeoff, and a `Test` control.
+3. You hit **Test all**. Bench runs each approach in its own background sandbox, tops up with the agent's current implementation if needed, and streams status into a narrow **sandbox peek rail**.
+4. In **~4 seconds**, the cards resolve with measured evidence: green/red test badges, runtime on 10k inputs, peak memory, LOC, deps, and failure details. The peek rail lets you jump into each sandbox's logs, diff, preview, and metrics.
+5. The spread tells the story: the readable version is clean and correct, the brute-force variant is 18× slower, the heap one is heavier for no gain, and a clever stack version actually **fails on `[]`** with the exact input shown.
+6. You click **Apply winner**. Bench patches the real workspace, hands the result back to the agent context, and remembers you lead with readability next time.
 
-**Punchline for judges:** *"Your agent gives you one answer. Bench gives you the measured best of four — in the time the agent took to write one. That's only possible because Cerebras runs a whole tournament while other models run a single suggestion."*
+**Punchline for judges:** *"Your agent gives you options. Bench lets you test all of them, side-by-side, inside VS Code — in the time the agent took to write one. That's only possible because Cerebras runs a whole tournament while other models run a single suggestion."*
 
-> The interactive board mockup (`bench-ui.html`) and the in-editor mockup (`bench-vscode-mockup.html`) already exist — they double as the demo storyboard.
+> The screenshot sketch maps to the v1 UI: editor on the left, Bench chat on the right, approach cards in the chat, and a slim sandbox peek rail for background instances.
 
 ---
 
@@ -51,9 +51,10 @@ That pattern just makes the *old* thing (writing code) faster. Bench doesn't try
 
 1. **The developer decides.** No single-right-answer theater. Show the real option space with evidence — the way a senior reasons and a junior learns to.
 2. **Honesty over confidence.** Every metric is a measured run in a sandbox. No claim ships without a number behind it. Purpose-built to kill the AI overconfidence that makes you afraid to merge.
-3. **The taste to stay quiet.** If the agent's answer has no real alternative, Bench validates it and gets out of the way — no tournament for a one-liner. Knowing *when not to fire* is the tasteful part.
-4. **Learn, don't lecture.** Taste is captured from picks, silently, and used to re-rank — never to nag.
-5. **Complement, don't compete.** Bench is agent-agnostic plumbing that makes Claude Code, Pi, Cursor, or a human better at choosing. **The agent's own output is always one of the four options** — Bench measures the agent against the alternatives, it never silently overrides it.
+3. **Stay in the editor.** The decision surface belongs next to the code, not in a separate dashboard. Chat, options, test runs, diffs, and apply actions all live in the VS Code side panel.
+4. **The taste to stay quiet.** If the agent's answer has no real alternative, Bench validates it and gets out of the way — no tournament for a one-liner. Knowing *when not to fire* is the tasteful part.
+5. **Learn, don't lecture.** Taste is captured from picks, silently, and used to re-rank — never to nag.
+6. **Complement, don't compete.** Bench is agent-agnostic plumbing that makes Claude Code, Pi, Cursor, or a human better at choosing. **The agent's own output is always one of the four options** — Bench measures the agent against the alternatives, it never silently overrides it.
 
 ---
 
@@ -61,20 +62,21 @@ That pattern just makes the *old* thing (writing code) faster. Bench doesn't try
 
 ### In scope (hackathon v1)
 - One language end-to-end: **Python** (richest, easiest to sandbox + measure).
+- A **VS Code extension** as the primary surface: right-side Bench chat, approach cards, `Test all`, sandbox peek rail, and `Apply winner`.
 - **Ingest from an agent:** take the function the agent just wrote (or the options it's weighing) as the input — the agent's version is always **slot 0**.
-- Integrate with **one agent end-to-end: Claude Code** via an **MCP server** (primary) and a **PostToolUse hook** (stretch); a **CLI** fallback that works with Pi or anything.
+- Integrate with **one agent end-to-end** through VS Code commands/selection capture, plus a **Claude Code MCP server** and **PostToolUse hook** as adapter paths; keep a **CLI** fallback that works with Pi or anything.
 - **Worth-benching gate** → either approve the agent's code as-is or stage a 4-way bench.
 - Parallel generation of the **3 alternatives** on Cerebras (slot 0 is free — the agent already wrote it).
 - Auto-generated **shared harness** (correctness tests + perf + memory) per problem.
-- N isolated Docker runs, streamed to a live board.
+- N isolated Docker runs, streamed into the extension UI.
 - Transparent scoring + taste-weighted ranking.
 - Backboard-persisted taste vector per (user, repo); visibly shifts on run #2.
-- **Feed the winner back** to the agent via the same channel it came in on.
+- **Apply the winner** into the real workspace and feed the decision back to the agent via the same channel it came in on.
 
 ### Out of scope (v1) — say this to judges proactively
 - Deep support for *many* agents (we wire Claude Code well + a universal CLI; Cursor/Aider/Copilot are day-2+).
 - Multi-language (TS/Go are day-2+).
-- A full IDE plugin / LSP (we attach via MCP / hook / CLI, not a language server).
+- A full LSP or deep language-service integration. v1 is an extension side panel plus commands, not a language server.
 - Security hardening beyond sane container isolation (we note the path, don't gold-plate it).
 - Multi-file / cross-module refactors. v1 is **function-level** decisions.
 
@@ -82,17 +84,20 @@ That pattern just makes the *old* thing (writing code) faster. Bench doesn't try
 
 ## 5. User flows
 
-**Flow A — agent wrote code, real tradeoff (the money path)**
-`agent writes merge_intervals → Bench ingests it (MCP/hook/CLI) → gate: "real alternatives, axes:[speed,memory,readability]" → keep agent's version as slot 0, generate 3 constrained alternatives → shared harness → run all 4 in sandboxes → score + rank by taste → board → user picks → winner fed back to agent → taste updated.`
+**Flow A — agent proposed approaches (the money path)**
+`agent says "we can do this 3 ways" → Bench side panel renders 3 approach cards → user clicks Test all → normalize/implement each approach as a runnable candidate → top up to 4 if needed → shared harness → run all candidates in sandboxes → stream status to peek rail → score + rank by taste → user applies winner → workspace patched → taste updated.`
 
-**Flow B — no real alternative (the restraint path)**
-`agent writes a one-liner / glue → gate: "no meaningful alternative" → validate the agent's code in one sandbox → approve inline, no tournament.`
+**Flow B — agent wrote code, real tradeoff**
+`agent writes merge_intervals → Bench ingests selected function / diff from VS Code → gate: "real alternatives, axes:[speed,memory,readability]" → keep agent's version as slot 0 → generate 3 constrained alternatives → run all 4 in sandboxes → cards show evidence → user picks → winner patched into editor and fed back to agent.`
 
-**Flow C — agent offered options (normalize path)**
-`agent emits "here are 3 ways…" (prose) → Bench implements/normalizes each into real candidates → tops up to 4 if needed → harness → measure → rank.`
+**Flow C — no real alternative (the restraint path)**
+`agent writes a one-liner / glue → gate: "no meaningful alternative" → validate the agent's code in one sandbox → approve inline in the chat, no tournament.`
 
-**Flow D — second run (the payoff)**
-`agent writes another function → board renders already ordered to the learned taste vector → "leading with readability, per your last 4 picks".`
+**Flow D — sandbox peek**
+`while Test all is running → peek rail shows one tab per sandbox → user opens Fast → sees logs, failing input, generated code diff, preview output, and raw metrics → returns to cards without leaving VS Code.`
+
+**Flow E — second run (the payoff)**
+`agent writes another function → approach cards render already ordered to the learned taste vector → "leading with readability, per your last 4 picks".`
 
 ---
 
@@ -100,49 +105,62 @@ That pattern just makes the *old* thing (writing code) faster. Bench doesn't try
 
 ```mermaid
 flowchart LR
-    AG[AI agent<br/>Claude Code / Pi]
-    AG -->|generated code or options| ING[Ingest adapter<br/>MCP tool / PostToolUse hook / CLI]
+    VS[VS Code extension<br/>side panel + commands]
+    CHAT[Bench chat<br/>approach cards]
+    PEEK[Sandbox peek rail<br/>logs / diff / preview / metrics]
+    AG[AI agent<br/>Claude Code / Pi / Cursor]
+    AG -->|generated code or options| VS
+    VS --> CHAT
+    VS -->|selection / diff / options| ING[Ingest adapter<br/>extension command / MCP / hook / CLI]
     ING --> B(Orchestrator<br/>FastAPI + asyncio)
     SEED[Agent's version<br/>= slot 0] --> D
     B --> G{Worth benching?<br/>Cerebras small model}
-    G -->|no real alternative| OK[Validate agent's code<br/>1 sandbox] --> UI
+    G -->|no real alternative| OK[Validate agent's code<br/>1 sandbox] --> CHAT
     G -->|yes: axes| C[Generate 3 alternatives<br/>Cerebras, parallel]
     H[Harness generator<br/>Cerebras] --> D
     C --> D[Sandbox pool<br/>N Docker containers]
     D -->|metrics JSON| R[Scorer + ranker]
+    D -->|run events| PEEK
     T[(Backboard<br/>taste vector)] --> R
-    R --> UI[Live board<br/>React + SSE]
-    R -->|winner| FB[Feed back to agent<br/>MCP result / hook stdout]
+    R --> CHAT
+    CHAT -->|apply winner| FB[Patch workspace<br/>+ feed back to agent]
     FB --> AG
-    UI -->|pick| T
+    CHAT -->|pick| T
 ```
 
 **Data flow, concretely:**
-1. The agent produces a function (or options). The **ingest adapter** captures `{code, function_name, language, repo_id, user_id, source_agent}` and posts it to the orchestrator.
+1. The agent produces a function or several prose approaches. The **VS Code extension** captures the selected code, active diff, function metadata, and chat options, then posts `{code, options, function_name, language, repo_id, user_id, source_channel}` to the orchestrator.
 2. **Slot 0 = the agent's version** is registered immediately (zero Cerebras tokens — the agent already wrote it).
-3. Orchestrator fires the **worth-benching gate** (cheap model). If no real alternative → validate slot 0 in one sandbox and approve, stop.
-4. Otherwise: fire **3 alternative-generation calls concurrently** (`asyncio.gather`) + **1 harness-generation call**.
+3. If the agent supplied approaches, Bench normalizes them into candidate cards; otherwise the orchestrator fires the **worth-benching gate** (cheap model). If no real alternative → validate slot 0 in one sandbox and approve inline in the chat, stop.
+4. Otherwise: fire **3 alternative-generation/normalization calls concurrently** (`asyncio.gather`) + **1 harness-generation call**.
 5. All 4 candidates (slot 0 + 3) schedule into **warm Docker containers**; each runs the shared harness; collect metrics JSON.
-6. Stream each card's state to the board over SSE: `queued → generating → running → pass/fail + metrics`.
+6. Stream each card and sandbox state to the extension over SSE: `queued → generating → running → pass/fail + metrics`; the chat cards show the summary, and the peek rail shows logs, diff, preview, and raw metrics per sandbox.
 7. Pull the taste vector from Backboard, compute weighted scores, mark the winner, render.
-8. On pick: write the pick event to Backboard (update the vector) **and feed the chosen code back to the agent** via the channel it arrived on.
+8. On pick: write the pick event to Backboard (update the vector), patch the selected implementation into the workspace, and feed the chosen code back to the agent via the channel it arrived on.
 
 ---
 
-## 7. Integration with AI coding agents
+## 7. VS Code extension + agent integrations
 
-Bench is agent-agnostic: it ingests whatever the agent produced and returns ranked, measured options. Three attachment points, in order of polish.
+Bench is agent-agnostic, but the primary user experience is now the VS Code extension. The extension owns the visible workflow; adapters decide how code/options enter and how the winner returns.
 
-**Claude Code (primary).**
-- *MCP server (explicit, recommended).* Ship Bench as an MCP server registered in the repo's `.mcp.json`. Mid-task, Claude Code calls the `bench` tool with the code it just wrote (or options it's weighing); Bench returns structured JSON (4 measured options + ranking); Claude reasons over it and continues with the chosen one. Most queryable; the agent decides when to call it.
-- *PostToolUse hook (automatic).* A hook matching `Write|Edit` fires after Claude writes a function; Bench runs and **injects the ranked results into Claude's context via stdout** — automatic, no prompting. (`PreToolUse` can even gate a write behind "bench it first," but that's heavy-handed and **off by default** — restraint.)
-- *`/bench` slash command (manual).* A custom command in `.claude/commands/` the dev triggers to bench the last function on demand; routes through the MCP tool.
+**VS Code extension (primary).**
+- *Side panel chat.* A `WebviewViewProvider` renders the Bench chat beside the editor. It behaves like a focused Cursor-style conversation, but its distinctive action is turning proposed approaches into testable cards.
+- *Structured approach cards.* Each card has a name, origin (`agent`, `normalized`, `generated`), rationale, expected tradeoff, status, metrics, and actions: `Test`, `View diff`, `Open sandbox`, `Apply`.
+- *Test all.* One command launches all candidate runs at once. Cards stream status while the backend generates missing candidates, builds the shared harness, and runs each sandbox.
+- *Sandbox peek rail.* A slim rail next to the chat has one item per candidate. Opening an item shows logs, generated code diff, preview output, failing inputs, and raw metrics without stealing the main editor.
+- *Apply winner.* The extension patches the current workspace via VS Code workspace edits, writes the pick to Backboard, and returns the decision to the active agent adapter if one is present.
+
+**Claude Code adapter.**
+- *MCP server (explicit, recommended).* Ship Bench as an MCP server registered in the repo's `.mcp.json`. Mid-task, Claude Code calls the `bench` tool with the code it just wrote (or options it's weighing); Bench returns structured JSON (4 measured options + ranking) and opens/updates the VS Code panel if available.
+- *PostToolUse hook (automatic).* A hook matching `Write|Edit` fires after Claude writes a function; Bench runs and **injects the ranked results into Claude's context via stdout** while the extension displays the richer visual comparison. (`PreToolUse` can gate a write behind "bench it first," but that's heavy-handed and **off by default** — restraint.)
+- *`/bench` slash command (manual).* A custom command in `.claude/commands/` the dev triggers to bench the last function on demand; routes through the same orchestrator as the extension.
 
 **Pi (and other lean CLIs).** Pi keeps a minimal four-tool core (read / write / edit / bash) and is extended via TypeScript extensions/skills rather than MCP. Bench attaches as a **Pi extension** (or a `bash`-tool call) that pipes the just-written file/diff to the Bench CLI and prints ranked results back into the session.
 
-**Universal fallback (any agent / human).** A `bench <file> --fn merge_intervals` CLI (plus clipboard/selection trigger) that takes a diff or function and prints/opens the board. This is the **demo-safe path** if live MCP/hook wiring misbehaves on the night.
+**Universal fallback (any agent / human).** A `bench <file> --fn merge_intervals` CLI (plus clipboard/selection trigger) that takes a diff or function and prints/opens the same run. This is the **demo-safe path** if live MCP/hook wiring misbehaves on the night.
 
-Across all three, **the agent's own implementation is always slot 0** — measured against the alternatives on the same harness, never silently replaced. Feeding the winner back uses the same channel it came in on (MCP tool result, or hook stdout injected into context).
+Across all entry points, **the agent's own implementation is always slot 0** — measured against the alternatives on the same harness, never silently replaced. Feeding the winner back uses the same channel it came in on when possible, and the extension always patches the workspace explicitly through the user's `Apply winner` action.
 
 > ⚠️ Pin the exact hook/MCP config to the **current Claude Code docs on Day 0** — the hook event names (`PreToolUse`/`PostToolUse`) and `.mcp.json` shape are stable, but matcher/exit-code semantics are worth re-checking. Docs linked in Sources.
 
@@ -152,9 +170,10 @@ Across all three, **the agent's own implementation is always slot 0** — measur
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Board (frontend) | **React + Vite** (or the existing single-file HTML board) | Real-time via **SSE** (simplest) or WebSocket. Mockups already built. |
+| Extension shell | **VS Code extension** (`WebviewViewProvider` + commands) | Primary product surface: side panel chat, approach cards, peek rail, workspace patching. |
+| Extension UI | **React + Vite webview** | Real-time via **SSE** (simplest) or WebSocket. Uses VS Code theme tokens and message passing for workspace actions. |
 | Orchestrator | **Python 3.11 + FastAPI + asyncio** | `asyncio.gather` for LLM fan-out; `asyncio.create_subprocess_exec` for container runs. One language across harness + service. |
-| Agent ingest | **MCP server** (`.mcp.json`) + **PostToolUse hook** for Claude Code; **CLI** fallback; **Pi TS extension** | Same FastAPI app exposes an MCP endpoint and a thin CLI. Ingests code/options, returns ranked JSON. No LSP this weekend. |
+| Agent ingest | **VS Code commands/selection capture** + **MCP server** (`.mcp.json`) + **PostToolUse hook** for Claude Code; **CLI** fallback; **Pi TS extension** | Same FastAPI app exposes an MCP endpoint and a thin CLI. Ingests code/options, returns ranked JSON. No LSP this weekend. |
 | LLM | **Cerebras Inference** via the **OpenAI Python SDK** at `https://api.cerebras.ai/v1` | Drop-in `OpenAI(base_url=..., api_key=CEREBRAS_API_KEY)`. |
 | Sandbox | **Docker** ephemeral containers, 1 per candidate, from a warm pool | Resource-capped, network-off, non-root, killed on timeout. gVisor (`runsc`) if time permits. |
 | Memory / taste | **Backboard** REST API | Persistent taste vector + pick log per (user, repo); portable across models. |
@@ -203,7 +222,7 @@ If `worth_benching` is false (one-liner, single idiomatic answer, trivial glue) 
 - **Slot 2** — "optimize raw runtime; clever is fine."
 - **Slot 3** — "minimize peak memory" *or* "fewest dependencies / stdlib-only" (pick per the axes the gate named).
 
-All three fire **concurrently**. If the agent instead emitted *several options* (Flow C), normalize those into slots first, then top up with generated ones to reach 4.
+All three fire **concurrently**. If the agent instead emitted *several options* (Flow A), normalize those into slots first, then top up with generated ones to reach 4. The UI still renders them the same way: one approach card per candidate, regardless of whether it started as agent prose, agent code, or a generated alternative.
 
 ### 9.3 Shared harness generation
 One Cerebras call produces a **single harness** used identically by every candidate (fairness). For Python it:
@@ -226,13 +245,21 @@ Each candidate runs in its **own ephemeral container**:
 ### 9.5 Scoring + ranking
 - **Correctness is a hard gate.** A candidate that fails tests is shown clearly (red, with the failing input) and sinks to the bottom — *including the agent's own version if it's the one that fails.* Honest by construction.
 - Among passing candidates, score = weighted sum over normalized axes (runtime, memory, LOC, deps), weights from the taste vector.
-- The board always shows **raw numbers**, not just the rank.
+- The approach cards always show **raw numbers**, not just the rank.
 
 ### 9.6 Taste layer (Backboard)
 - Taste vector dimensions: `{readability, speed, memory, simplicity, few_deps}`.
 - On each **pick**, nudge weights toward the axes where the chosen candidate was strongest (simple online update; counts → normalized).
 - Stored per `(user_id, repo_id)` in Backboard; pulled at ranking time; re-ranks run #2 visibly.
 - Because Backboard is portable across models, the taste survives model swaps and travels across repos/teammates — the "junior inherits the team's taste" story.
+
+### 9.7 Extension UI contract
+The VS Code panel has two working zones:
+
+- **Bench chat + approach cards.** The chat handles ordinary back-and-forth, but when Bench detects options it switches into a decision state: cards are stacked in the chat transcript with status, metrics, and actions. The primary CTA is `Test all` before measurement and `Apply winner` after measurement.
+- **Sandbox peek rail.** A narrow rail shows the running instances as compact items (`A`, `B`, `C`, `D`) with status color and latency. Selecting one opens a detail drawer with tabs for `Logs`, `Diff`, `Preview`, `Tests`, and `Metrics`.
+
+The editor remains the source of truth. Bench can preview diffs and generated code in the panel, but it does not modify the workspace until the user chooses `Apply winner`.
 
 ---
 
@@ -241,17 +268,21 @@ Each candidate runs in its **own ephemeral container**:
 ```jsonc
 // BenchRun
 { "run_id", "user_id", "repo_id", "function_name", "language",
-  "source_agent": "claude-code|pi|cli", "worth_benching", "axes": ["runtime","memory"], "created_at" }
+  "source_channel": "vscode|claude-code|pi|cli", "worth_benching", "axes": ["runtime","memory"], "created_at" }
 
 // Candidate
 { "candidate_id", "run_id",
   "slot": "agent|readable|fast|low_mem|few_deps",   // slot 0 == "agent"
-  "origin": "agent|generated", "model", "code", "rationale" }
+  "origin": "agent|normalized|generated", "ui_label", "model", "code", "rationale" }
 
 // Result  (one per candidate, from the sandbox)
 { "candidate_id", "passed": 14, "total": 14,
   "failures": [{"input","expected","got"}],
   "runtime_ms": 0.8, "peak_kb": 41, "loc": 9, "deps": [] }
+
+// SandboxPeek
+{ "candidate_id", "status": "queued|generating|running|passed|failed",
+  "logs_url", "diff", "preview", "metrics", "last_event_at" }
 
 // TasteVector  (Backboard, per user+repo)
 { "user_id", "repo_id",
@@ -298,28 +329,30 @@ The headline: **a bench run is tiny** (~11k tokens) and it's even cheaper than a
 
 ## 12. Build plan (weekend)
 
-**Day 0 (prep, ~1–2h):** Cerebras key + confirm live model IDs; `docker pull` the Python image + build the warm-pool harness runner; Backboard key + a 3-field taste schema; scaffold FastAPI + the existing board; skeleton **MCP server + `.mcp.json`** and confirm Claude Code hook/MCP config from current docs.
+**Day 0 (prep, ~1–2h):** Cerebras key + confirm live model IDs; `docker pull` the Python image + build the warm-pool harness runner; Backboard key + a 3-field taste schema; scaffold FastAPI + the **VS Code extension shell**; skeleton **MCP server + `.mcp.json`** and confirm Claude Code hook/MCP config from current docs.
 
-**Day 1 — the bench core + agent ingest:**
-- Ingest path: accept the agent's function via the **MCP tool / CLI**; register it as **slot 0**.
+**Day 1 — extension shell + bench core:**
+- Build the side panel webview with chat transcript, structured approach cards, `Test all`, sandbox peek rail, and `Apply winner`.
+- Ingest path: accept selected code / active diff from VS Code and the agent's function via **MCP tool / CLI**; register the agent implementation as **slot 0**.
 - Cerebras generates **3 constrained alternatives** (concurrent).
 - Harness generator → one shared runner.
 - All 4 candidates run in Docker against the harness (timing + memory + tests) → metrics JSON.
-- Results stream to the board (SSE). *Milestone: agent's version + 3 alternatives render with a real spread.*
+- Results stream to the extension over SSE. *Milestone: agent's version + 3 alternatives render as cards with a real measured spread.*
 
-**Day 2 — the taste layer + restraint + feedback:**
+**Day 2 — peek rail + taste + apply flow:**
+- Wire each sandbox to the peek rail: logs, diff, preview, failing inputs, and raw metrics.
 - Backboard stores a per-(user,repo) vector from picks; re-ranks; **show it shift on run #2.**
 - Implement the **worth-benching gate** ("no real alternative → approve inline").
-- **Feed the winner back** to the agent (MCP tool result / hook stdout).
+- **Apply the winner** into the workspace and feed it back to the agent (extension workspace edit + MCP tool result / hook stdout).
 - Warm container pool to hide cold starts.
 
 **Day 3 — polish + lock the demo:**
-- Wire the **PostToolUse hook** so Bench fires automatically inside a real Claude Code session (with `/bench` + CLI as fallbacks).
-- Tighten the board (flashy states already exist in the mockups).
+- Wire the **PostToolUse hook** so Bench can fire from a real Claude Code session while updating the VS Code side panel (with `/bench` + CLI as fallbacks).
+- Tighten the extension UX: card density, status states, peek drawer tabs, diff preview, and apply confirmation.
 - Lock **2–3 demo functions** that reliably produce a spread: one fast/ugly, one clean/slow, one where the "clever" version misses an edge case.
-- Rehearse the 90-second script inside Claude Code; record a backup video.
+- Rehearse the 90-second script inside VS Code; record a backup video.
 
-**Cuts if behind (in order):** drop the hook, demo via the **CLI/`/bench`** path; single model for all slots (keep the constrained-slot prompts — that's what guarantees diversity); pre-pull image + warm pool; pre-compute one demo function as a fallback.
+**Cuts if behind (in order):** drop the hook, demo via VS Code command + selected function; collapse the peek rail detail tabs into one raw log/metrics drawer; single model for all slots (keep the constrained-slot prompts — that's what guarantees diversity); pre-pull image + warm pool; pre-compute one demo function as a fallback.
 
 ---
 
@@ -327,9 +360,11 @@ The headline: **a bench run is tiny** (~11k tokens) and it's even cheaper than a
 
 | Risk | Mitigation |
 |---|---|
-| Live MCP/hook wiring flaky on the demo machine | Rehearsed **CLI / `/bench` fallback** path; pre-recorded backup video. |
+| Extension shell eats too much build time | Keep the webview thin: cards, peek rail, and apply flow only; no custom editor, no LSP, no Marketplace polish. |
+| Live MCP/hook wiring flaky on the demo machine | Rehearsed VS Code command + selected-function path; CLI / `/bench` fallback; pre-recorded backup video. |
+| Webview state drifts from backend run state | Treat the orchestrator as source of truth; replay run snapshots on panel reload; stream incremental updates over SSE. |
 | Alternatives don't differ enough from the agent's seed | **Constrained-slot prompts** (readable/fast/low-mem/few-deps), not temperature; optionally different models per slot. |
-| Agent's version looks unfairly favored/disfavored | Always **slot 0**, same shared harness, same evidence shown; it can and will lose (or fail) on the board. |
+| Agent's version looks unfairly favored/disfavored | Always **slot 0**, same shared harness, same evidence shown; it can and will lose (or fail) in the cards. |
 | Cold-start latency blows the 4s | **Warm pool** of pre-booted containers; pre-pull image; keep harness tiny. |
 | Untrusted generated code | `--network none`, read-only, non-root, mem/cpu/pids caps, hard timeout; gVisor if time. |
 | Flaky timing numbers on demo wifi | Timing happens **inside the container**, not over the network; run the perf loop ≥3× and report median. |
@@ -341,10 +376,10 @@ The headline: **a bench run is tiny** (~11k tokens) and it's even cheaper than a
 
 ## 14. Stretch / post-hackathon
 - Deep integrations beyond Claude Code + Pi: **Cursor, Aider, Windsurf, Copilot**.
-- **Auto-bench mode:** the hook silently benches every non-trivial function the agent writes, surfacing only when an alternative beats the agent's pick on an axis you care about.
+- **Auto-bench mode:** the extension silently benches every non-trivial function the agent writes, surfacing only when an alternative beats the agent's pick on an axis you care about.
 - TS + Go sandboxes; language auto-detect.
 - Team taste (shared Backboard vector); "house style" inheritance for new hires.
-- **PR-time mode:** Bench posts the tradeoff board as a PR comment on functions it judges to have real options.
+- **PR-time mode:** Bench posts the measured option comparison as a PR comment on functions it judges to have real options.
 - One-line alt idea, if judges prefer pain over judgment: a **bug-reproduction agent** — vague report in ("checkout breaks for some users"), runnable minimal repro out in seconds, by firing many hypotheses across parallel sandboxes (same three tools, Cerebras as the parallelism hero).
 
 ---
@@ -380,6 +415,9 @@ SURROUNDING CONTEXT:
 ---
 
 ## Sources
+
+**VS Code extension surface**
+- [Extension API](https://code.visualstudio.com/api) · [Webview API](https://code.visualstudio.com/api/extension-guides/webview) · [VS Code API Reference — WebviewViewProvider](https://code.visualstudio.com/api/references/vscode-api#WebviewViewProvider)
 
 **Cerebras**
 - [Pricing](https://www.cerebras.ai/pricing) · [Inference](https://www.cerebras.ai/inference) · [Docs — Pricing](https://inference-docs.cerebras.ai/support/pricing) · [Docs — Rate Limits](https://inference-docs.cerebras.ai/support/rate-limits) · [Docs — Model Catalog](https://inference-docs.cerebras.ai/models/overview)
