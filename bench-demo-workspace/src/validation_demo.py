@@ -1,40 +1,32 @@
 def validate_student_payload(payload: dict[str, object]) -> dict[str, object]:
     """Bench demo: several valid validation styles exist for the same payload."""
-from fastapi import FastAPI, Request, HTTPException
-
-
-class AuthMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] == "/protected":
-            headers = dict(scope.get("headers", []))
-            auth_header = headers.get(b"authorization", b"").decode()
-            
-            if not auth_header:
-                response = HTTPException(status_code=401, detail="Missing bearer token")
-                await response(scope, receive, send)
-                return
-            
-            if auth_header != "Bearer test-token":
-                response = HTTPException(status_code=403, detail="Invalid bearer token")
-                await response(scope, receive, send)
-                return
-        
-        await self.app(scope, receive, send)
-
+from fastapi import FastAPI, Header, HTTPException, status
 
 def create_app() -> FastAPI:
     app = FastAPI()
-    app = AuthMiddleware(app)
-
+    
     @app.get("/health")
     def health():
         return {"status": "ok"}
-
+    
     @app.get("/protected")
-    def protected():
-        return {"authenticated": True, "strategy": "middleware"}
-
+    def protected(authorization: str = Header(None)):
+        if authorization is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing authorization header"
+            )
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authorization header format"
+            )
+        token = authorization.split(" ")[1]
+        if token != "test-token":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid token"
+            )
+        return {"message": "Access granted", "token": token}
+    
     return app

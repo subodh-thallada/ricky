@@ -84,6 +84,9 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         case "newFeatureChat":
           this.reset();
           break;
+        case "viewLogs":
+          await this.fetchCandidateLogs(message.optionId, message.openInEditor);
+          break;
       }
     });
   }
@@ -460,6 +463,57 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     return fixtureId === "fastapi-auth-endpoint"
       ? this.sandboxRunner.runFastApiAuthEndpoint(options, callbacks, signal)
       : this.sandboxRunner.runPythonMerge(options, callbacks, signal);
+  }
+
+  private async fetchCandidateLogs(optionId?: string, openInEditor?: boolean): Promise<void> {
+    const option = this.options.find((candidate) => candidate.id === optionId);
+    if (!option) {
+      return;
+    }
+
+    if (!option.logsUrl) {
+      if (openInEditor) {
+        void vscode.window.showInformationMessage("No Docker logs yet. Run Test all first.");
+        return;
+      }
+      this.view?.webview.postMessage({
+        type: "logs",
+        optionId: option.id,
+        status: option.runStatus,
+        notice: "No Docker logs yet — run Test all first."
+      });
+      return;
+    }
+
+    try {
+      const content = await this.sandboxRunner.fetchText(option.logsUrl);
+      if (openInEditor) {
+        const doc = await vscode.workspace.openTextDocument({
+          content,
+          language: "log"
+        });
+        await vscode.window.showTextDocument(doc, { preview: false });
+        return;
+      }
+      this.view?.webview.postMessage({
+        type: "logs",
+        optionId: option.id,
+        status: option.runStatus,
+        content
+      });
+    } catch (error) {
+      const message = formatError(error);
+      if (openInEditor) {
+        void vscode.window.showErrorMessage(`Bench could not load Docker logs. ${message}`);
+        return;
+      }
+      this.view?.webview.postMessage({
+        type: "logs",
+        optionId: option.id,
+        status: option.runStatus,
+        error: message
+      });
+    }
   }
 
   private syncMessageOptions(): void {
@@ -952,6 +1006,140 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   .svg-logs { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%238c90a0' d='M20 19H4v-1h16v1zm0-14H4v1h16V5zm0 7H4v1h16v-1z'/%3E%3C/svg%3E") no-repeat center / contain; display: inline-block; width: 14px; height: 14px; }
   .svg-send { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23b1c5ff' d='M2.01 21 23 12 2.01 3 2 10l15 2-15 2z'/%3E%3C/svg%3E") no-repeat center / contain; width: 15px; height: 15px; display: inline-block; }
   .svg-plus { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23c2c6d7' d='M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z'/%3E%3C/svg%3E") no-repeat center / contain; width: 16px; height: 16px; display: inline-block; }
+  .svg-close { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23c2c6d7' d='M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.7 2.88 18.3 9.17 12 2.88 5.71 4.29 4.3l6.3 6.29 6.29-6.3z'/%3E%3C/svg%3E") no-repeat center / contain; width: 16px; height: 16px; display: inline-block; }
+  .svg-open { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23c2c6d7' d='M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z'/%3E%3C/svg%3E") no-repeat center / contain; width: 16px; height: 16px; display: inline-block; }
+  .svg-terminal { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23b1c5ff' d='M4 6h16v12H4V6zm2 2v8h12V8H6zm2 2 3 2-3 2v-1.5l1.5-1-1.5-1V10zm4 0h4v1.5h-4V10z'/%3E%3C/svg%3E") no-repeat center / contain; width: 16px; height: 16px; display: inline-block; }
+  .logs-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: none;
+    flex-direction: column;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(2px);
+  }
+  .logs-overlay.open { display: flex; }
+  .logs-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    margin-left: auto;
+    width: 100%;
+    max-width: 100%;
+    background: var(--surface);
+    border-left: 1px solid var(--border-strong);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+  }
+  .logs-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-high);
+    flex-shrink: 0;
+  }
+  .logs-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .logs-title {
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 20px;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .logs-header-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .logs-tabs {
+    display: flex;
+    gap: 0;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .logs-tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--mute);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    line-height: 14px;
+    margin-bottom: -1px;
+    padding: 10px 12px;
+    text-transform: uppercase;
+    transition: color 160ms ease, border-color 160ms ease;
+  }
+  .logs-tab:hover { color: var(--text-soft); }
+  .logs-tab.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+  }
+  .logs-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    background: #0a0a0a;
+  }
+  .logs-body::-webkit-scrollbar { width: 8px; }
+  .logs-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; border: 2px solid #0a0a0a; }
+  .logs-pane { display: none; min-height: 100%; }
+  .logs-pane.active { display: block; }
+  .logs-terminal {
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 16px;
+    color: #d4d4d4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log-line { display: block; }
+  .log-line.system { color: var(--mute); }
+  .log-line.error { color: var(--fail); }
+  .log-line.success { color: var(--pass); }
+  .logs-empty {
+    padding: 16px 12px;
+    color: var(--mute);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 16px;
+  }
+  .logs-pane-details { padding: 12px; background: #0f0f0f; }
+  .logs-pane-metrics { padding: 12px; background: #0f0f0f; }
+  .logs-pane-metrics .metrics { padding: 0; }
+  .logs-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-high);
+    flex-shrink: 0;
+  }
+  .logs-footer .outline-btn {
+    font-size: 11px;
+    line-height: 16px;
+    padding: 5px 10px;
+  }
+  .logs-footer .select-btn {
+    font-size: 11px;
+    line-height: 16px;
+    padding: 5px 12px;
+  }
 </style>
 </head>
 <body>
@@ -977,6 +1165,37 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     </form>
   </div>
 
+  <div class="logs-overlay" id="logsOverlay" aria-hidden="true">
+    <div class="logs-panel" role="dialog" aria-modal="true" aria-labelledby="logsTitle">
+      <div class="logs-header">
+        <div class="logs-header-left">
+          <i class="svg-terminal" aria-hidden="true"></i>
+          <span class="logs-title" id="logsTitle">Approach A - Logs</span>
+        </div>
+        <div class="logs-header-actions">
+          <button class="icon-btn" type="button" title="Open in editor" aria-label="Open logs in editor" data-action="openLogsInEditor"><i class="svg-open"></i></button>
+          <button class="icon-btn" type="button" title="Close" aria-label="Close logs panel" data-action="closeLogs"><i class="svg-close"></i></button>
+        </div>
+      </div>
+      <div class="logs-tabs" role="tablist">
+        <button class="logs-tab" type="button" role="tab" data-tab="details" aria-selected="false">Details</button>
+        <button class="logs-tab active" type="button" role="tab" data-tab="logs" aria-selected="true">Logs</button>
+        <button class="logs-tab" type="button" role="tab" data-tab="metrics" aria-selected="false">Metrics</button>
+      </div>
+      <div class="logs-body">
+        <div class="logs-pane logs-pane-details" data-pane="details"></div>
+        <div class="logs-pane logs-pane-logs active" data-pane="logs">
+          <div class="logs-empty" id="logsContent">Loading Docker logs...</div>
+        </div>
+        <div class="logs-pane logs-pane-metrics" data-pane="metrics"></div>
+      </div>
+      <div class="logs-footer">
+        <button class="outline-btn" type="button" data-action="clearLogs">Clear</button>
+        <button class="select-btn" type="button" data-action="copyLogs">Copy Logs</button>
+      </div>
+    </div>
+  </div>
+
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const messagesEl = document.getElementById('messages');
@@ -985,15 +1204,28 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     const runBarEl = document.getElementById('runBar');
     const statusEl = document.getElementById('status');
     const sendEl = document.querySelector('.send-btn');
+    const logsOverlayEl = document.getElementById('logsOverlay');
+    const logsTitleEl = document.getElementById('logsTitle');
 
     let state = normalizeState({ messages: [], options: [], loading: false });
-    const expandedOptionIds = new Set();
+    let logsPanel = {
+      optionId: undefined,
+      optionIndex: 0,
+      activeTab: 'logs',
+      logText: '',
+      loading: false
+    };
 
     window.addEventListener('message', (event) => {
       const data = event.data;
       if (data && data.type === 'state') {
         state = normalizeState(data.state);
         render();
+        if (logsPanel.optionId) {
+          refreshLogsPanelContent();
+        }
+      } else if (data && data.type === 'logs') {
+        handleLogsMessage(data);
       }
     });
 
@@ -1024,19 +1256,45 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       if (!actionNode) actionNode = target;
 
       const action = actionNode.getAttribute('data-action');
-      const optionId = target.closest('[data-option-id]')?.getAttribute('data-option-id');
+      const optionId = target.closest('[data-option-id]')?.getAttribute('data-option-id') || logsPanel.optionId;
+      const tab = actionNode.getAttribute('data-tab');
 
       if (action === 'newChat') {
-        expandedOptionIds.clear();
+        closeLogsPanel();
         vscode.postMessage({ type: 'newFeatureChat' });
       }
-      else if (action === 'toggleDetails' && optionId) {
-        if (expandedOptionIds.has(optionId)) expandedOptionIds.delete(optionId);
-        else expandedOptionIds.add(optionId);
-        render();
+      else if (action === 'viewLogs' && optionId) {
+        openLogsPanel(optionId);
+      }
+      else if (action === 'closeLogs') {
+        closeLogsPanel();
+      }
+      else if (action === 'openLogsInEditor' && logsPanel.optionId) {
+        vscode.postMessage({ type: 'viewLogs', optionId: logsPanel.optionId, openInEditor: true });
+      }
+      else if (action === 'clearLogs') {
+        clearLogsContent();
+      }
+      else if (action === 'copyLogs') {
+        copyLogsContent();
+      }
+      else if (tab) {
+        setLogsTab(tab);
       }
       else if (action && optionId) vscode.postMessage({ type: action, optionId });
       else if (action) vscode.postMessage({ type: action });
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && logsOverlayEl.classList.contains('open')) {
+        closeLogsPanel();
+      }
+    });
+
+    logsOverlayEl.addEventListener('click', (event) => {
+      if (event.target === logsOverlayEl) {
+        closeLogsPanel();
+      }
     });
 
     function normalizeState(next) {
@@ -1215,7 +1473,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         const status = String(option.runStatus || 'draft');
         const letter = String.fromCharCode(65 + index);
         const statusLabel = status.replace(/_/g, ' ');
-        const isExpanded = expandedOptionIds.has(option.id);
+        const isFailedStatus = status === 'failed' || status === 'error' || status === 'timeout';
 
         let iconClass = 'svg-draft';
         if (status === 'passed') iconClass = 'svg-check';
@@ -1263,12 +1521,6 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
         card.appendChild(renderMetrics(option, status));
 
-        if (isExpanded) {
-          const details = document.createElement('div');
-          details.innerHTML = renderInlineDetails(option, status);
-          card.appendChild(details.firstElementChild || details);
-        }
-
         const actions = document.createElement('div');
         actions.className = 'card-actions';
         const leftActions = document.createElement('div');
@@ -1278,12 +1530,11 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         const detailButton = document.createElement('button');
         detailButton.className = 'action-btn view-logs';
         detailButton.type = 'button';
-        detailButton.dataset.action = 'toggleDetails';
-        detailButton.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+        detailButton.dataset.action = 'viewLogs';
         const detailIcon = document.createElement('i');
-        detailIcon.className = 'svg-' + (status === 'failed' || status === 'error' ? 'logs' : 'metrics');
+        detailIcon.className = 'svg-' + (isFailedStatus ? 'logs' : 'metrics');
         detailButton.appendChild(detailIcon);
-        detailButton.appendChild(document.createTextNode(' ' + (isExpanded ? 'Hide Details' : (status === 'failed' || status === 'error' ? 'View Logs' : 'Details'))));
+        detailButton.appendChild(document.createTextNode(' ' + (isFailedStatus ? 'View Logs' : 'Details')));
         leftActions.appendChild(detailButton);
         const selectButton = document.createElement('button');
         selectButton.className = 'select-btn';
@@ -1443,6 +1694,167 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       return issues;
     }
 
+    function findOptionContext(optionId) {
+      const allOptions = [];
+      for (const message of state.messages || []) {
+        if (Array.isArray(message.options)) {
+          allOptions.push(...message.options);
+        }
+      }
+      if (!allOptions.length && Array.isArray(state.options)) {
+        allOptions.push(...state.options);
+      }
+      const index = allOptions.findIndex((option) => option.id === optionId);
+      if (index < 0) {
+        return undefined;
+      }
+      return { option: allOptions[index], index };
+    }
+
+    function openLogsPanel(optionId) {
+      const context = findOptionContext(optionId);
+      if (!context) {
+        return;
+      }
+      const status = String(context.option.runStatus || 'draft');
+      const isFailedStatus = status === 'failed' || status === 'error' || status === 'timeout';
+      logsPanel = {
+        optionId,
+        optionIndex: context.index,
+        activeTab: isFailedStatus ? 'logs' : 'details',
+        logText: '',
+        loading: true
+      };
+      logsOverlayEl.classList.add('open');
+      logsOverlayEl.setAttribute('aria-hidden', 'false');
+      logsTitleEl.textContent = 'Approach ' + String.fromCharCode(65 + context.index) + ' - Logs';
+      setLogsTab(logsPanel.activeTab);
+      refreshLogsPanelContent();
+      renderLogsContent('Loading Docker logs...', 'system');
+      vscode.postMessage({ type: 'viewLogs', optionId });
+    }
+
+    function closeLogsPanel() {
+      logsOverlayEl.classList.remove('open');
+      logsOverlayEl.setAttribute('aria-hidden', 'true');
+      logsPanel = {
+        optionId: undefined,
+        optionIndex: 0,
+        activeTab: 'logs',
+        logText: '',
+        loading: false
+      };
+    }
+
+    function setLogsTab(tab) {
+      logsPanel.activeTab = tab;
+      document.querySelectorAll('.logs-tab').forEach((node) => {
+        const isActive = node.getAttribute('data-tab') === tab;
+        node.classList.toggle('active', isActive);
+        node.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      });
+      document.querySelectorAll('.logs-pane').forEach((node) => {
+        node.classList.toggle('active', node.getAttribute('data-pane') === tab);
+      });
+    }
+
+    function refreshLogsPanelContent() {
+      const context = logsPanel.optionId ? findOptionContext(logsPanel.optionId) : undefined;
+      if (!context) {
+        return;
+      }
+      const option = context.option;
+      const status = String(option.runStatus || 'draft');
+      const detailsPane = document.querySelector('.logs-pane-details');
+      const metricsPane = document.querySelector('.logs-pane-metrics');
+      if (detailsPane) {
+        detailsPane.innerHTML = renderInlineDetails(option, status);
+      }
+      if (metricsPane) {
+        metricsPane.replaceChildren(renderMetrics(option, status));
+      }
+    }
+
+    function handleLogsMessage(data) {
+      if (!logsPanel.optionId || data.optionId !== logsPanel.optionId) {
+        return;
+      }
+      logsPanel.loading = false;
+      if (data.error) {
+        logsPanel.logText = data.error;
+        renderLogsContent(data.error, 'error');
+        return;
+      }
+      if (data.notice) {
+        logsPanel.logText = data.notice;
+        renderLogsContent(data.notice, 'system');
+        return;
+      }
+      logsPanel.logText = textOrEmpty(data.content);
+      renderLogsContent(logsPanel.logText, 'plain');
+    }
+
+    function renderLogsContent(text, kind) {
+      const logsPane = document.querySelector('.logs-pane-logs');
+      if (!logsPane) {
+        return;
+      }
+      if (!text) {
+        logsPane.innerHTML = '<div class="logs-empty">No Docker logs returned for this candidate.</div>';
+        return;
+      }
+      const terminal = document.createElement('div');
+      terminal.className = 'logs-terminal';
+      terminal.id = 'logsContent';
+      const lines = String(text).split(/\\r?\\n/);
+      lines.forEach((line, index) => {
+        const row = document.createElement('span');
+        row.className = 'log-line' + (kind === 'system' ? ' system' : kind === 'error' ? ' error' : classifyLogLine(line));
+        row.textContent = line || (index < lines.length - 1 ? '' : '');
+        terminal.appendChild(row);
+        if (index < lines.length - 1) {
+          terminal.appendChild(document.createTextNode('\\n'));
+        }
+      });
+      logsPane.replaceChildren(terminal);
+    }
+
+    function classifyLogLine(line) {
+      const trimmed = String(line || '').trim().toLowerCase();
+      if (!trimmed) {
+        return '';
+      }
+      if (trimmed.startsWith('[system]') || trimmed.includes('sandbox process exited')) {
+        return ' system';
+      }
+      if (trimmed.includes('fail') || trimmed.includes('error') || trimmed.includes('traceback')) {
+        return ' error';
+      }
+      if (trimmed.includes('passed') || trimmed.includes('ok')) {
+        return ' success';
+      }
+      return '';
+    }
+
+    function clearLogsContent() {
+      logsPanel.logText = '';
+      renderLogsContent('', 'system');
+    }
+
+    async function copyLogsContent() {
+      const text = logsPanel.logText || '';
+      if (!text) {
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        }
+      } catch (error) {
+        console.error('Bench copy logs failed', error);
+      }
+    }
+
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
     }
@@ -1464,9 +1876,11 @@ type WebviewMessage = {
     | "rejectPreview"
     | "newFeatureChat"
     | "testAll"
-    | "applyWinner";
+    | "applyWinner"
+    | "viewLogs";
   text?: string;
   optionId?: string;
+  openInEditor?: boolean;
 };
 
 type WebviewState = {
