@@ -249,6 +249,8 @@ def _build_test_suggestion_dicts(prompt: str) -> list[dict[str, object]]:
     lowered = prompt.lower()
     if "fibonacci" in lowered:
         raw = _fibonacci_test_options()
+    elif "enrollment" in lowered and "sync" in lowered or "sync_enrollments" in lowered:
+        raw = _enrollment_sync_test_options()
     elif "students" in lowered and "endpoint" in lowered or "get students" in lowered:
         raw = _students_endpoint_test_options()
     elif "cache" in lowered or "caching" in lowered:
@@ -449,6 +451,143 @@ def _students_endpoint_test_options() -> list[dict[str, object]]:
                 "\n"
                 "    results = [student for student in STUDENTS if all(predicate(student) for predicate in predicates)]\n"
                 "    return [asdict(student) for student in results[:limit]]\n"
+                "```"
+            ),
+        },
+    ]
+
+
+def _enrollment_sync_test_options() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "enrollment-sync-dict-index",
+            "title": "Dictionary-index sync",
+            "summary": "Build student-id indexes first, then do one clear reconciliation pass for updates, additions, and archives.",
+            "implementationPlan": "Create indexed maps for existing and incoming records, compare normalized snapshots, then assemble the SyncResult in explicit phases.",
+            "tradeoffs": ["Very readable for backend work", "Uses extra temporary maps"],
+            "generatedCode": (
+                "### src/student_enrollment_sync_demo.py\n"
+                "```python\n"
+                "def sync_enrollments(\n"
+                "    existing: list[EnrollmentRecord],\n"
+                "    incoming: list[EnrollmentRecord],\n"
+                "    archive_missing: bool = False,\n"
+                ") -> SyncResult:\n"
+                "    existing_by_id = {record.student_id: record for record in existing}\n"
+                "    incoming_by_id = {record.student_id: record for record in incoming}\n"
+                "\n"
+                "    active: list[EnrollmentRecord] = []\n"
+                "    added_ids: list[int] = []\n"
+                "    updated_ids: list[int] = []\n"
+                "    archived_ids: list[int] = []\n"
+                "\n"
+                "    for student_id, incoming_record in incoming_by_id.items():\n"
+                "        normalized = EnrollmentRecord(\n"
+                "            student_id=incoming_record.student_id,\n"
+                "            section=incoming_record.section.strip(),\n"
+                "            status=incoming_record.status.strip().lower(),\n"
+                "            advisor=incoming_record.advisor.strip(),\n"
+                "            tags=normalize_tags(incoming_record.tags),\n"
+                "        )\n"
+                "        existing_record = existing_by_id.get(student_id)\n"
+                "        if existing_record is None:\n"
+                "            added_ids.append(student_id)\n"
+                "            active.append(normalized)\n"
+                "            continue\n"
+                "        if snapshot_record(existing_record) != snapshot_record(normalized):\n"
+                "            updated_ids.append(student_id)\n"
+                "        active.append(normalized)\n"
+                "\n"
+                "    if archive_missing:\n"
+                "        for student_id in existing_by_id:\n"
+                "            if student_id not in incoming_by_id:\n"
+                "                archived_ids.append(student_id)\n"
+                "\n"
+                "    return SyncResult(active=active, added_ids=added_ids, updated_ids=updated_ids, archived_ids=archived_ids)\n"
+                "```"
+            ),
+        },
+        {
+            "id": "enrollment-sync-ordered-pass",
+            "title": "Ordered pass with carry-forward records",
+            "summary": "Preserve incoming order and handle reconciliation in a single pass, then optionally archive leftovers.",
+            "implementationPlan": "Track unmatched existing records in a mutable map, walk the incoming list once, and archive what remains only if requested.",
+            "tradeoffs": ["Good when output order matters", "Slightly more stateful to read"],
+            "generatedCode": (
+                "### src/student_enrollment_sync_demo.py\n"
+                "```python\n"
+                "def sync_enrollments(\n"
+                "    existing: list[EnrollmentRecord],\n"
+                "    incoming: list[EnrollmentRecord],\n"
+                "    archive_missing: bool = False,\n"
+                ") -> SyncResult:\n"
+                "    remaining_existing = {record.student_id: record for record in existing}\n"
+                "    active: list[EnrollmentRecord] = []\n"
+                "    added_ids: list[int] = []\n"
+                "    updated_ids: list[int] = []\n"
+                "\n"
+                "    for incoming_record in incoming:\n"
+                "        normalized = EnrollmentRecord(\n"
+                "            student_id=incoming_record.student_id,\n"
+                "            section=incoming_record.section.strip(),\n"
+                "            status=incoming_record.status.strip().lower(),\n"
+                "            advisor=incoming_record.advisor.strip(),\n"
+                "            tags=normalize_tags(incoming_record.tags),\n"
+                "        )\n"
+                "        previous = remaining_existing.pop(normalized.student_id, None)\n"
+                "        if previous is None:\n"
+                "            added_ids.append(normalized.student_id)\n"
+                "        elif snapshot_record(previous) != snapshot_record(normalized):\n"
+                "            updated_ids.append(normalized.student_id)\n"
+                "        active.append(normalized)\n"
+                "\n"
+                "    archived_ids = sorted(remaining_existing) if archive_missing else []\n"
+                "    return SyncResult(active=active, added_ids=added_ids, updated_ids=updated_ids, archived_ids=archived_ids)\n"
+                "```"
+            ),
+        },
+        {
+            "id": "enrollment-sync-helper-driven",
+            "title": "Helper-driven sync with normalization stage",
+            "summary": "Split normalization from reconciliation so the workflow is easier to test in smaller pieces.",
+            "implementationPlan": "Normalize incoming data first, then reconcile ids and snapshots in a compact second phase using helper closures.",
+            "tradeoffs": ["Best for testability and reuse", "Adds a bit more indirection"],
+            "generatedCode": (
+                "### src/student_enrollment_sync_demo.py\n"
+                "```python\n"
+                "def sync_enrollments(\n"
+                "    existing: list[EnrollmentRecord],\n"
+                "    incoming: list[EnrollmentRecord],\n"
+                "    archive_missing: bool = False,\n"
+                ") -> SyncResult:\n"
+                "    def normalize(record: EnrollmentRecord) -> EnrollmentRecord:\n"
+                "        return EnrollmentRecord(\n"
+                "            student_id=record.student_id,\n"
+                "            section=record.section.strip(),\n"
+                "            status=record.status.strip().lower(),\n"
+                "            advisor=record.advisor.strip(),\n"
+                "            tags=normalize_tags(record.tags),\n"
+                "        )\n"
+                "\n"
+                "    normalized_existing = {record.student_id: normalize(record) for record in existing}\n"
+                "    normalized_incoming = [normalize(record) for record in incoming]\n"
+                "\n"
+                "    added_ids = [record.student_id for record in normalized_incoming if record.student_id not in normalized_existing]\n"
+                "    updated_ids = [\n"
+                "        record.student_id\n"
+                "        for record in normalized_incoming\n"
+                "        if record.student_id in normalized_existing\n"
+                "        and snapshot_record(normalized_existing[record.student_id]) != snapshot_record(record)\n"
+                "    ]\n"
+                "    incoming_ids = {record.student_id for record in normalized_incoming}\n"
+                "    archived_ids = sorted(student_id for student_id in normalized_existing if student_id not in incoming_ids) if archive_missing else []\n"
+                "\n"
+                "    return SyncResult(\n"
+                "        active=normalized_incoming,\n"
+                "        added_ids=added_ids,\n"
+                "        updated_ids=updated_ids,\n"
+                "        archived_ids=archived_ids,\n"
+                "    )\n"
                 "```"
             ),
         },
