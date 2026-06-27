@@ -54,6 +54,7 @@ class RunStore:
         winner_candidate_id: str | None,
         summary: str | None,
         recommended_next_action: str | None,
+        available_actions: list[dict[str, Any]] | None = None,
     ) -> None:
         record.status = "completed"
         record.completed_at = utc_now()
@@ -61,6 +62,7 @@ class RunStore:
         record.winner_candidate_id = winner_candidate_id
         record.summary = summary
         record.recommended_next_action = recommended_next_action
+        record.available_actions = available_actions or []
 
     def fail_run(self, record: RunRecord, error: str) -> None:
         record.status = "failed"

@@ -130,7 +130,7 @@ def candidate_logs(run_id: str, candidate_id: str) -> PlainTextResponse:
 @app.get("/runs/{run_id}/candidates/{candidate_id}/code")
 def candidate_code(run_id: str, candidate_id: str) -> PlainTextResponse:
     candidate = _get_candidate(run_id, candidate_id)
-    return PlainTextResponse(candidate.code)
+    return PlainTextResponse(candidate.code_bundle())
 
 
 @app.post("/maintenance/clear-local-runs")

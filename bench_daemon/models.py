@@ -10,6 +10,7 @@ from typing import Any
 TERMINAL_RUN_STATUSES = {"completed", "failed"}
 TERMINAL_CANDIDATE_STATUSES = {"passed", "failed", "timeout", "error"}
 STATUS_RANK = {"passed": 0, "failed": 1, "timeout": 2, "error": 3}
+RECOMMENDED_NEXT_ACTION = "Return evidence to coding agent"
 
 
 def utc_now() -> str:
@@ -37,10 +38,14 @@ class CandidateRecord:
     label: str
     rationale: str | None
     code: str
+    files: dict[str, str] = field(default_factory=dict)
     status: str = "queued"
     exit_code: int | None = None
     duration_ms: float | None = None
     tests: dict[str, int] | None = None
+    failures: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
     logs: str = ""
     workspace_path: Path | None = None
     retained_workspace: bool = False
@@ -58,7 +63,25 @@ class CandidateRecord:
         }
         if self.rationale:
             payload["rationale"] = self.rationale
+        if self.failures:
+            payload["failures"] = self.failures
+        if self.errors:
+            payload["errors"] = self.errors
+        if self.metrics:
+            payload["metrics"] = self.metrics
         return payload
+
+    def code_bundle(self) -> str:
+        if not self.files:
+            return self.code
+        if len(self.files) == 1:
+            return next(iter(self.files.values()))
+
+        parts: list[str] = []
+        for relative_path in sorted(self.files):
+            contents = self.files[relative_path]
+            parts.append(f"### {relative_path}\n{contents.rstrip()}\n")
+        return "\n".join(parts)
 
 
 @dataclass
@@ -76,6 +99,7 @@ class RunRecord:
     candidate_order: list[str] = field(default_factory=list)
     candidates: dict[str, CandidateRecord] = field(default_factory=dict)
     ranked_candidate_ids: list[str] = field(default_factory=list)
+    available_actions: list[dict[str, Any]] = field(default_factory=list)
     events: list[RunEvent] = field(default_factory=list)
     subscribers: set[Any] = field(default_factory=set)
 
@@ -88,6 +112,13 @@ class RunRecord:
         return [self.candidates[candidate_id] for candidate_id in order]
 
     def to_payload(self) -> dict[str, Any]:
+        available_actions = self.available_actions
+        if not available_actions and self.status == "completed":
+            available_actions = build_available_actions(
+                self.winner_candidate_id,
+                self._winner_is_passing(),
+            )
+
         payload: dict[str, Any] = {
             "run_id": self.run_id,
             "fixture_id": self.fixture_id,
@@ -98,6 +129,7 @@ class RunRecord:
                 candidate.to_payload(self.run_id) for candidate in self.sorted_candidates()
             ],
             "recommended_next_action": self.recommended_next_action,
+            "available_actions": available_actions,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -105,6 +137,12 @@ class RunRecord:
         if self.error:
             payload["error"] = self.error
         return payload
+
+    def _winner_is_passing(self) -> bool:
+        if not self.winner_candidate_id:
+            return False
+        winner = self.candidates.get(self.winner_candidate_id)
+        return winner is not None and winner.status == "passed"
 
 
 def rank_candidates(candidates: list[CandidateRecord]) -> list[CandidateRecord]:
@@ -127,15 +165,32 @@ def build_summary(ranked: list[CandidateRecord]) -> tuple[str | None, str | None
         summary = (
             f"{winner.label} passed all tests and was fastest among passing candidates."
         )
-        action = f"Apply {winner.candidate_id}"
     elif winner.status == "failed":
         summary = f"No candidate passed; {winner.label} had the best failing result."
-        action = f"Inspect {winner.candidate_id}"
     elif winner.status == "timeout":
         summary = f"No candidate completed successfully; {winner.label} timed out."
-        action = f"Inspect {winner.candidate_id}"
     else:
         summary = f"No candidate completed successfully; {winner.label} errored."
-        action = f"Inspect {winner.candidate_id}"
 
-    return winner.candidate_id, summary, action
+    return winner.candidate_id, summary, RECOMMENDED_NEXT_ACTION
+
+
+def build_available_actions(
+    winner_candidate_id: str | None,
+    can_apply_winner: bool = False,
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = [
+        {
+            "action": "return_evidence",
+            "label": "Return evidence to coding agent",
+        }
+    ]
+    if winner_candidate_id and can_apply_winner:
+        actions.append(
+            {
+                "action": "apply_candidate",
+                "label": "Offer apply winner",
+                "candidate_id": winner_candidate_id,
+            }
+        )
+    return actions

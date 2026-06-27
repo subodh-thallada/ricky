@@ -40,6 +40,56 @@ class FixtureTests(unittest.TestCase):
                 ],
             )
 
+    def test_rejects_duplicate_candidate_ids(self):
+        fixture = load_fixture("python-merge")
+
+        with self.assertRaises(FixtureError):
+            parse_candidate_request(
+                fixture,
+                [
+                    {
+                        "candidate_id": "same",
+                        "files": {"candidate_target.py": "def merge_intervals(intervals):\n    return []\n"},
+                    },
+                    {
+                        "candidate_id": "same",
+                        "files": {"candidate_target.py": "def merge_intervals(intervals):\n    return intervals\n"},
+                    },
+                ],
+            )
+
+    def test_rejects_unsafe_candidate_paths(self):
+        fixture = load_fixture("python-merge")
+
+        with self.assertRaises(FixtureError):
+            parse_candidate_request(
+                fixture,
+                [
+                    {
+                        "candidate_id": "bad",
+                        "files": {
+                            "candidate_target.py": "def merge_intervals(intervals):\n    return []\n",
+                            "../escape.py": "print('nope')",
+                        },
+                    }
+                ],
+            )
+
+    def test_rejects_invalid_candidate_metadata(self):
+        fixture = load_fixture("python-merge")
+
+        with self.assertRaises(FixtureError):
+            parse_candidate_request(
+                fixture,
+                [
+                    {
+                        "candidate_id": "bad",
+                        "label": 42,
+                        "files": {"candidate_target.py": "def merge_intervals(intervals):\n    return []\n"},
+                    }
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

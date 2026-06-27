@@ -6,6 +6,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 
@@ -26,6 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--fixture-id", default="python-merge")
     run.add_argument("--rebuild-image", action="store_true")
     run.add_argument("--poll-seconds", type=float, default=0.25)
+    run.add_argument(
+        "--request-json",
+        help="Path to a Candidate Evaluation Request JSON file, or '-' for stdin.",
+    )
 
     fixtures = subcommands.add_parser("fixtures", help="List daemon fixtures")
     fixtures.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -35,7 +40,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args.host, args.port, args.reload)
     if args.command == "run":
-        return _run(args.base_url, args.fixture_id, args.rebuild_image, args.poll_seconds)
+        return _run(
+            args.base_url,
+            args.fixture_id,
+            args.rebuild_image,
+            args.poll_seconds,
+            args.request_json,
+        )
     if args.command == "fixtures":
         payload = _request_json("GET", f"{args.base_url}/fixtures")
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -65,8 +76,9 @@ def _run(
     fixture_id: str,
     rebuild_image: bool,
     poll_seconds: float,
+    request_json: str | None = None,
 ) -> int:
-    body = {
+    body = _load_run_request(request_json) if request_json else {
         "fixture_id": fixture_id,
         "rebuild_image": rebuild_image,
         "candidates": None,
@@ -80,6 +92,21 @@ def _run(
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get("status") == "completed" else 1
         time.sleep(poll_seconds)
+
+
+def _load_run_request(path: str | None) -> dict[str, Any]:
+    if not path:
+        raise SystemExit("--request-json requires a file path or '-'")
+
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid request JSON: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise SystemExit("Candidate Evaluation Request JSON must be an object")
+    return payload
 
 
 def _request_json(

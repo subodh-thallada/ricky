@@ -336,7 +336,11 @@ The **Decision Payload** stays compact. It includes candidate summaries inline a
       "code_url": "/runs/run_123/candidates/readable/code"
     }
   ],
-  "recommended_next_action": "Apply readable"
+  "recommended_next_action": "Return evidence to coding agent",
+  "available_actions": [
+    {"action": "return_evidence", "label": "Return evidence to coding agent"},
+    {"action": "apply_candidate", "label": "Offer apply winner", "candidate_id": "readable"}
+  ]
 }
 ```
 
@@ -410,7 +414,8 @@ The editor remains the source of truth. Bench can preview diffs and generated co
 // DecisionPayload
 { "run_id", "winner_candidate_id", "summary",
   "candidates": [{"candidate_id", "status", "duration_ms"}],
-  "recommended_next_action": "Apply <label>" }
+  "recommended_next_action": "Return evidence to coding agent",
+  "available_actions": [{"action": "return_evidence"}, {"action": "apply_candidate"}] }
 
 // TasteVector  (Backboard, per user+repo)
 { "user_id", "repo_id",

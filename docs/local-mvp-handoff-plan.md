@@ -53,7 +53,7 @@ Each fixture owns its runtime environment and runner config:
 }
 ```
 
-For the local MVP, candidates are full replacements for `target_file`. Real patches and multi-file edits come later.
+For the local MVP, candidates are full replacements for `target_file`. A Candidate may include additional relative text files, but patch-based editing comes later.
 
 ## Decision Payload
 
@@ -76,9 +76,15 @@ Return summaries inline. Keep full logs and code behind detail endpoints.
       "code_url": "/runs/run_123/candidates/readable/code"
     }
   ],
-  "recommended_next_action": "Apply readable"
+  "recommended_next_action": "Return evidence to coding agent",
+  "available_actions": [
+    {"action": "return_evidence", "label": "Return evidence to coding agent"},
+    {"action": "apply_candidate", "label": "Offer apply winner", "candidate_id": "readable"}
+  ]
 }
 ```
+
+`recommended_next_action` is backend-facing: return measured evidence to the coding agent or calling surface. If the ranked winner passed, `available_actions` also exposes an `apply_candidate` action for the calling surface to render. The daemon does not apply code to the real workspace.
 
 ## Daemon API
 
@@ -116,6 +122,44 @@ If `candidates` is null, load all files from `candidates_dir`. Later, the callin
     "candidate_target.py": "def merge_intervals(intervals):\n    ..."
   }
 }
+```
+
+`POST /runs` is asynchronous. It returns a `run_id`, `events_url`, and `result_url`; callers poll `GET /runs/{run_id}` or subscribe to `GET /runs/{run_id}/events` until the run reaches `completed` or `failed`. The completed run snapshot is the Decision Payload.
+
+The code detail endpoint returns the exact replacement files supplied for that Candidate. A single-file fixture returns the target file content; multi-file candidates are returned as a deterministic text bundle with one section per relative path.
+
+## Agent-Facing Commands
+
+Start the daemon:
+
+```bash
+python3 -m bench_daemon serve --host 127.0.0.1 --port 8000
+```
+
+Run the prewritten no-network fixture Candidates and print the final Decision Payload:
+
+```bash
+python3 -m bench_daemon run --fixture-id python-merge
+```
+
+Submit explicit Candidate replacement files from a request JSON file:
+
+```bash
+python3 -m bench_daemon run --request-json docs/candidate-evaluation-request.example.json
+```
+
+Equivalent raw API call:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/runs \
+  -H 'Content-Type: application/json' \
+  --data @docs/candidate-evaluation-request.example.json
+```
+
+Then poll the returned `result_url`, for example:
+
+```bash
+curl -s http://127.0.0.1:8000/runs/run_123
 ```
 
 ## Run Algorithm
@@ -160,6 +204,7 @@ Event names:
 
 ```text
 run_started
+image_build_skipped
 image_build_started
 image_build_finished
 candidate_queued
@@ -178,7 +223,10 @@ Example candidate event:
   "candidate_id": "slow",
   "status": "passed",
   "duration_ms": 6.673,
-  "tests": {"passed": 8, "failed": 0, "total": 8}
+  "tests": {"passed": 8, "failed": 0, "total": 8},
+  "failures": [],
+  "errors": [],
+  "metrics": {"runtime_p95_ms": 6.1}
 }
 ```
 

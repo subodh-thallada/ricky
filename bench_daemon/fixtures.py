@@ -173,13 +173,13 @@ def parse_candidate_request(
             _validate_relative_path(relative_path, f"candidate file {relative_path}")
             normalized_files[relative_path] = contents
 
-        label = raw.get("label")
-        rationale = raw.get("rationale")
+        label = _optional_string(raw, "label", candidate_id)
+        rationale = _optional_string(raw, "rationale", candidate_id)
         parsed.append(
             CandidateInput(
                 candidate_id=candidate_id,
-                label=label if isinstance(label, str) and label else _label_from_id(candidate_id),
-                rationale=rationale if isinstance(rationale, str) else None,
+                label=label or _label_from_id(candidate_id),
+                rationale=rationale,
                 files=normalized_files,
             )
         )
@@ -201,6 +201,19 @@ def _required_int(raw: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise FixtureError(f"bench.json must include integer {key}")
     return value
+
+
+def _optional_string(
+    raw: dict[str, Any], key: str, candidate_id: str
+) -> str | None:
+    if key not in raw or raw[key] is None:
+        return None
+    value = raw[key]
+    if not isinstance(value, str):
+        raise FixtureError(f"Candidate {candidate_id} {key} must be text")
+    if key == "label" and not value:
+        raise FixtureError(f"Candidate {candidate_id} label must not be empty")
+    return value or None
 
 
 def _validate_id(value: str, label: str) -> None:

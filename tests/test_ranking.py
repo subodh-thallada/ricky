@@ -32,7 +32,17 @@ class RankingTests(unittest.TestCase):
 
         self.assertEqual(winner_id, "fast")
         self.assertIn("Fast passed all tests", summary)
-        self.assertEqual(action, "Apply fast")
+        self.assertEqual(action, "Return evidence to coding agent")
+
+    def test_summary_preserves_backend_action_when_no_candidate_passed(self):
+        failed = CandidateRecord("broken", "Broken", None, "", status="failed")
+        failed.duration_ms = 2
+
+        winner_id, summary, action = build_summary([failed])
+
+        self.assertEqual(winner_id, "broken")
+        self.assertIn("No candidate passed", summary)
+        self.assertEqual(action, "Return evidence to coding agent")
 
 
 if __name__ == "__main__":

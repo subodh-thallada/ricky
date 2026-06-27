@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .fixtures import CandidateInput, FixtureConfig
-from .models import CandidateRecord, build_summary, rank_candidates
+from .models import CandidateRecord, build_available_actions, build_summary, rank_candidates
 from .paths import LOCAL_RUNS_ROOT
 from .state import RunStore
 
@@ -70,12 +70,18 @@ class BenchOrchestrator:
 
             ranked = rank_candidates(list(record.candidates.values()))
             winner_candidate_id, summary, action = build_summary(ranked)
+            can_apply_winner = bool(ranked and ranked[0].status == "passed")
+            available_actions = build_available_actions(
+                winner_candidate_id,
+                can_apply_winner,
+            )
             self.store.complete_run(
                 record,
                 [candidate.candidate_id for candidate in ranked],
                 winner_candidate_id,
                 summary,
                 action,
+                available_actions,
             )
             await self.store.emit(
                 record,
@@ -84,6 +90,8 @@ class BenchOrchestrator:
                     "status": record.status,
                     "winner_candidate_id": winner_candidate_id,
                     "summary": summary,
+                    "recommended_next_action": action,
+                    "available_actions": available_actions,
                 },
             )
         except Exception as exc:
@@ -109,6 +117,14 @@ class BenchOrchestrator:
             exists = inspect.exit_code == 0
 
         if exists:
+            await self.store.emit(
+                record,
+                "image_build_skipped",
+                {
+                    "docker_image": fixture.docker_image,
+                    "reason": "image_exists",
+                },
+            )
             return
 
         await self.store.emit(
@@ -162,9 +178,10 @@ class BenchOrchestrator:
                 },
             )
 
-            workspace = _create_workspace(record.run_id, fixture, candidate)
+            workspace = create_candidate_workspace(record.run_id, fixture, candidate)
             current.workspace_path = workspace
             current.code = candidate.files[fixture.target_file]
+            current.files = dict(candidate.files)
 
             command = [
                 "docker",
@@ -195,7 +212,7 @@ class BenchOrchestrator:
                 timeout_seconds=fixture.timeout_ms / 1000,
                 container_name=_container_name(record.run_id, candidate.candidate_id),
             )
-            _apply_command_result(current, result)
+            apply_command_result(current, result)
 
             if current.status == "passed":
                 shutil.rmtree(workspace, ignore_errors=True)
@@ -212,6 +229,9 @@ class BenchOrchestrator:
                     "exit_code": current.exit_code,
                     "duration_ms": current.duration_ms,
                     "tests": current.tests,
+                    "failures": current.failures,
+                    "errors": current.errors,
+                    "metrics": current.metrics,
                 },
             )
 
@@ -223,6 +243,7 @@ def make_candidate_records(candidates: list[CandidateInput], fixture: FixtureCon
             label=candidate.label,
             rationale=candidate.rationale,
             code=candidate.files[fixture.target_file],
+            files=dict(candidate.files),
         )
         for candidate in candidates
     ]
@@ -250,7 +271,7 @@ def parse_runner_output(result: CommandResult) -> tuple[str, dict[str, object] |
     return logs, parsed, ""
 
 
-def _apply_command_result(candidate: CandidateRecord, result: CommandResult) -> None:
+def apply_command_result(candidate: CandidateRecord, result: CommandResult) -> None:
     candidate.exit_code = result.exit_code
     if result.timed_out:
         candidate.status = "timeout"
@@ -272,6 +293,9 @@ def _apply_command_result(candidate: CandidateRecord, result: CommandResult) -> 
     tests = parsed.get("tests")
     duration_ms = parsed.get("duration_ms")
     candidate.tests = tests if _is_tests_summary(tests) else {"passed": 0, "failed": 1, "total": 1}
+    candidate.failures = _list_of_dicts(parsed.get("failures"))
+    candidate.errors = _list_of_dicts(parsed.get("errors"))
+    candidate.metrics = _extract_metrics(parsed)
     candidate.duration_ms = (
         float(duration_ms)
         if isinstance(duration_ms, int | float)
@@ -337,7 +361,7 @@ async def _remove_container(container_name: str) -> None:
     await proc.communicate()
 
 
-def _create_workspace(
+def create_candidate_workspace(
     run_id: str, fixture: FixtureConfig, candidate: CandidateInput
 ) -> Path:
     workspace = LOCAL_RUNS_ROOT / run_id / candidate.candidate_id
@@ -384,3 +408,22 @@ def _is_tests_summary(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     return all(isinstance(value.get(key), int) for key in ("passed", "failed", "total"))
+
+
+def _list_of_dicts(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _extract_metrics(parsed: dict[str, object]) -> dict[str, object]:
+    metrics: dict[str, object] = {}
+    for key in ("metrics", "benchmark_metrics", "benchmarks"):
+        value = parsed.get(key)
+        if isinstance(value, dict):
+            metrics.update(value)
+    return metrics
+
+
+_apply_command_result = apply_command_result
+_create_workspace = create_candidate_workspace

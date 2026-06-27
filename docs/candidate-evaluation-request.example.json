@@ -1,0 +1,38 @@
+{
+  "fixture_id": "python-merge",
+  "rebuild_image": false,
+  "candidates": [
+    {
+      "candidate_id": "broken_edge_case",
+      "label": "Broken Edge Case",
+      "rationale": "Readable implementation, but it forgets the empty-input guard.",
+      "files": {
+        "candidate_target.py": "def merge_intervals(intervals):\n    ordered = sorted(intervals, key=lambda interval: interval[0])\n    merged = [ordered[0][:]]\n\n    for start, end in ordered[1:]:\n        current = merged[-1]\n        if start <= current[1]:\n            current[1] = max(current[1], end)\n        else:\n            merged.append([start, end])\n\n    return merged\n"
+      }
+    },
+    {
+      "candidate_id": "fast",
+      "label": "Fast",
+      "rationale": "Sort once and minimize per-loop work.",
+      "files": {
+        "candidate_target.py": "def merge_intervals(intervals):\n    if not intervals:\n        return []\n\n    ordered = sorted((start, end) for start, end in intervals)\n    merged = []\n    append = merged.append\n\n    current_start, current_end = ordered[0]\n    for start, end in ordered[1:]:\n        if start <= current_end:\n            if end > current_end:\n                current_end = end\n        else:\n            append([current_start, current_end])\n            current_start, current_end = start, end\n\n    append([current_start, current_end])\n    return merged\n"
+      }
+    },
+    {
+      "candidate_id": "readable",
+      "label": "Readable",
+      "rationale": "Clear sort-and-sweep implementation.",
+      "files": {
+        "candidate_target.py": "def merge_intervals(intervals):\n    \"\"\"Merge overlapping [start, end] intervals.\"\"\"\n    if not intervals:\n        return []\n\n    ordered = sorted(intervals, key=lambda interval: interval[0])\n    merged = [ordered[0][:]]\n\n    for start, end in ordered[1:]:\n        current = merged[-1]\n        if start <= current[1]:\n            current[1] = max(current[1], end)\n        else:\n            merged.append([start, end])\n\n    return merged\n"
+      }
+    },
+    {
+      "candidate_id": "slow",
+      "label": "Slow",
+      "rationale": "Correct but intentionally less efficient repeated merge.",
+      "files": {
+        "candidate_target.py": "def merge_intervals(intervals):\n    remaining = [interval[:] for interval in intervals]\n    merged = []\n\n    while remaining:\n        start, end = remaining.pop(0)\n        changed = True\n\n        while changed:\n            changed = False\n            next_remaining = []\n            for other_start, other_end in remaining:\n                overlaps = other_start <= end and start <= other_end\n                if overlaps:\n                    start = min(start, other_start)\n                    end = max(end, other_end)\n                    changed = True\n                else:\n                    next_remaining.append([other_start, other_end])\n            remaining = next_remaining\n\n        merged.append([start, end])\n\n    return sorted(merged, key=lambda interval: interval[0])\n"
+      }
+    }
+  ]
+}
