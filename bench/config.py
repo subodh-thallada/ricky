@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     cerebras_api_key: str = ""
     cerebras_base_url: str = "https://api.cerebras.ai/v1"
-    cerebras_model: str = "gpt-oss-120b"
+    cerebras_model: str = "zai-glm-4.7"
     backboard_api_key: str = ""
     backboard_llm_provider: str = "openrouter"
     backboard_model_name: str = "moonshotai/kimi-k2.6"

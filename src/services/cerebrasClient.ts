@@ -21,7 +21,7 @@ export class CerebrasClient {
     }
 
     const model = vscode.workspace.getConfiguration("bench").get<string>("cerebrasModel")?.trim()
-      || "llama-4-scout-17b-16e-instruct";
+      || "zai-glm-4.7";
 
     const response = await fetch("https://api.cerebras.ai/v1/chat/completions", {
       method: "POST",

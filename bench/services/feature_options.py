@@ -28,6 +28,8 @@ class FeatureOptionsService:
             repo_context=request.repo_context,
             editor_context=_request_to_editor_context(request),
         )
+        if real_mode:
+            inferred_context = _expand_repo_context_for_real_mode(inferred_context)
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
 
@@ -168,6 +170,7 @@ def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
         "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
         "### relative/path.ext\n```language\n...code...\n```\n"
         "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
+        "You may create a new file when that is the cleanest implementation. If you do, always use an explicit workspace-relative path.\n"
         "Placement rules for generatedCode:\n"
         "- Prefer one focused file when possible so Bench can preview inline.\n"
         "- If a focused file or active file already appears to contain the target function/class/placeholder, align the code to that file and that symbol.\n"
@@ -218,6 +221,15 @@ def _make_context_summary(metadata: dict[str, object]) -> str:
     strategy = metadata.get("strategy", "unknown")
     cache_hit = metadata.get("cache_hit", False)
     return f"Using {files} summarized files via {strategy}. Cache hit: {cache_hit}."
+
+
+def _expand_repo_context_for_real_mode(config: RepoContextConfig) -> RepoContextConfig:
+    expanded = config.model_copy(deep=True)
+    expanded.max_files = max(expanded.max_files, 28)
+    expanded.max_file_chars = max(expanded.max_file_chars, 3500)
+    expanded.max_total_chars = max(expanded.max_total_chars, 45000)
+    expanded.snippet_context_lines = max(expanded.snippet_context_lines, 12)
+    return expanded
 
 
 def _build_assistant_message(option_count: int) -> str:
