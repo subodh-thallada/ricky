@@ -35,41 +35,11 @@ def sync_enrollments(
     incoming: list[EnrollmentRecord],
     archive_missing: bool = False,
 ) -> SyncResult:
-    # Build a lookup for existing records by (student_id, section)
-    existing_lookup: dict[tuple[int, str], EnrollmentRecord] = {
-        (rec.student_id, rec.section.strip()): rec for rec in existing
-    }
+    """Bench demo: several correct sync strategies exist for this workflow."""
+    raise NotImplementedError("Ask Bench: implement enrollment sync for this module (test)")
 
-    added_ids: list[int] = []
-    updated_ids: list[int] = []
-    seen_keys: set[tuple[int, str]] = set()
 
-    for inc in incoming:
-        key = (inc.student_id, inc.section.strip())
-        seen_keys.add(key)
-        if key not in existing_lookup:
-            # New enrollment
-            added_ids.append(inc.student_id)
-            existing.append(inc)
-            existing_lookup[key] = inc
-        else:
-            exist = existing_lookup[key]
-            if snapshot_record(exist) != snapshot_record(inc):
-                updated_ids.append(inc.student_id)
-                # Update mutable fields in place
-                exist.status = inc.status
-                exist.advisor = inc.advisor
-                exist.tags = inc.tags
-
-    archived_ids: list[int] = []
-    if archive_missing:
-        # Identify records to archive (not seen in incoming)
-        to_archive = [rec for rec in existing if (rec.student_id, rec.section.strip()) not in seen_keys]
-        for rec in to_archive:
-            archived_ids.append(rec.student_id)
-            existing.remove(rec)
-
-    return SyncResult(active=existing, added_ids=added_ids, updated_ids=updated_ids, archived_ids=archived_ids)def summarize_sync(result: SyncResult) -> dict[str, int]:
+def summarize_sync(result: SyncResult) -> dict[str, int]:
     return {
         "active": len(result.active),
         "added": len(result.added_ids),

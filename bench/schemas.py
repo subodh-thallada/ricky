@@ -81,9 +81,17 @@ class FeatureOption(BaseModel):
     implementation_plan: str = Field(alias="implementationPlan")
     tradeoffs: list[str]
     generated_code: str = Field(alias="generatedCode")
-    metrics: BenchMetricSet
+    metrics: BenchMetricSet | None = None
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @property
+    def implementationPlan(self) -> str:
+        return self.implementation_plan
+
+    @property
+    def generatedCode(self) -> str:
+        return self.generated_code
 
 
 class FeatureOptionsResponse(BaseModel):
@@ -189,5 +197,3 @@ class RoutedReplyResponse(BaseModel):
     items: list[ChatItem]
     raw_text: str
     context_summary: dict[str, object]
-
-

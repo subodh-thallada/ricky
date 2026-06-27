@@ -84,19 +84,25 @@ def _serialize_options(options: list[FeatureOption]) -> list[dict[str, object]]:
 
 def _parse_options(content: str) -> list[FeatureOption]:
     cleaned = content.replace("```json", "").replace("```", "").strip()
-    payload = _load_options_json(cleaned)
-    raw_suggestions = payload.get("suggestions", [])
+    try:
+        payload = _load_options_json(cleaned)
+    except ValueError:
+        return [_build_raw_code_option(cleaned)]
+
+    raw_suggestions = payload.get("suggestions", payload.get("options", []))
     if not isinstance(raw_suggestions, list):
-        raise ValueError("Cerebras response did not contain a suggestions array.")
+        return [_build_raw_code_option(cleaned)]
 
     options: list[FeatureOption] = []
     for index, item in enumerate(raw_suggestions[:4]):
+        if not isinstance(item, dict):
+            continue
         normalized = {
             "id": item.get("id") or f"option-{index + 1}",
             "title": item.get("title") or f"Option {index + 1}",
             "summary": item.get("summary") or "",
             "implementationPlan": item.get("implementationPlan") or "",
-            "tradeoffs": item.get("tradeoffs") or [],
+            "tradeoffs": _normalize_tradeoffs(item.get("tradeoffs")),
             "generatedCode": item.get("generatedCode") or "",
         }
         option = FeatureOption.model_validate(
@@ -107,8 +113,32 @@ def _parse_options(content: str) -> list[FeatureOption]:
         if option.title and normalized["generatedCode"]:
             options.append(option)
     if not options:
-        raise ValueError("Cerebras returned no usable implementation options.")
+        return [_build_raw_code_option(cleaned)]
     return options
+
+
+def _build_raw_code_option(content: str) -> FeatureOption:
+    return FeatureOption.model_validate(
+        {
+            "id": "cerebras-draft",
+            "title": "Cerebras draft",
+            "summary": "Cerebras returned code-shaped output instead of structured option JSON.",
+            "implementationPlan": "Review the generated code, preview it in the editor, and ask Bench to refine if the draft needs more structure.",
+            "tradeoffs": [
+                "Preserves useful model output instead of failing the request",
+                "May have less structured comparison data than a fully formatted response",
+            ],
+            "generatedCode": content.strip() or "# Cerebras returned an empty response.",
+        }
+    )
+
+
+def _normalize_tradeoffs(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def _load_options_json(cleaned: str) -> dict[str, object]:
