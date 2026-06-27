@@ -1,5 +1,7 @@
 # Bench
 
+<img width="1639" height="959" alt="image" src="https://github.com/user-attachments/assets/d6043091-7ba2-4d19-bd2e-2ef613b17863" />
+
 Bench is a VS Code extension plus local orchestrator for comparing implementation options before you choose one.
 
 The current MVP does this:
