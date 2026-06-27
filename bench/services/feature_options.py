@@ -161,14 +161,43 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         cleaned = re.sub(r"```$", "", cleaned).strip()
     try:
         parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if not match:
+    except json.JSONDecodeError as exc:
+        json_text = _extract_first_json_object(cleaned)
+        if json_text is None:
             raise
-        parsed = json.loads(match.group(0))
+        parsed = json.loads(json_text)
     if not isinstance(parsed, dict):
         raise ValueError("Gemini response was not a JSON object.")
     return parsed
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text[start:], start=start):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
 
 
 def _normalize_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
