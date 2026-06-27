@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException
 
 from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
-from bench.clients.gemini import GeminiClient
 from bench.config import get_settings
 from bench.schemas import (
     BenchRunPreviewResponse,
@@ -29,8 +28,6 @@ thread_store = ThreadStore()
 
 
 def _build_llm_client(settings):
-    if settings.primary_llm_provider == "gemini":
-        return GeminiClient(settings)
     return CerebrasClient(settings)
 
 
@@ -42,12 +39,10 @@ async def health() -> dict[str, str]:
 @app.get("/providers/check")
 async def providers_check() -> dict[str, object]:
     settings = get_settings()
-    gemini = GeminiClient(settings)
     cerebras = CerebrasClient(settings)
     backboard = BackboardAdapter(settings)
     return {
-        "primary_provider": settings.primary_llm_provider,
-        "gemini": await gemini.check(),
+        "primary_provider": "cerebras",
         "cerebras": await cerebras.check(),
         "backboard": await backboard.check(),
     }

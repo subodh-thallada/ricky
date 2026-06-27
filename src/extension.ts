@@ -38,7 +38,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Preview now loads directly into the editor as an inline draft."
+      content: "Tell me what feature you want to build. Cerebras will generate the options, and Bench will preview them directly in the editor as inline drafts."
     }
   ];
   private options: BenchOption[] = [];
@@ -103,7 +103,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.messages.push({ id: createId("user"), role: "user", content: prompt });
-    this.postState({ loading: true, notice: "Asking Gemini to plan, then Cerebras to write code..." });
+    this.postState({ loading: true, notice: "Asking Cerebras to generate implementation options..." });
 
     try {
       const workspaceContext = getWorkspaceContext();
@@ -115,7 +115,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       this.messages.push({
         id: messageId,
         role: "assistant",
-        content: result.message || `I generated ${this.options.length} implementation options. Gemini supplied the chat, context, plans, and mock metrics; Cerebras wrote the code only.`,
+        content: result.message || `I generated ${this.options.length} implementation options with Cerebras. Bench attached local mock metrics for comparison.`,
         options: cloneOptions(this.options)
       });
       this.postState();
@@ -408,7 +408,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Gemini chats and scores. Cerebras writes code. Preview loads directly into the editor before you apply it.</div>
+      <div class="sub">Cerebras generates options. Bench scores locally and previews changes directly in the editor before you apply them.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
@@ -453,7 +453,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     function render() {
       sendEl.disabled = Boolean(state.loading);
-      statusEl.textContent = state.loading ? 'Gemini planning, Cerebras writing code...' : (state.notice || '');
+      statusEl.textContent = state.loading ? 'Cerebras generating implementation options...' : (state.notice || '');
       statusEl.className = state.error ? 'status error' : 'status';
       messagesEl.innerHTML = '';
 
@@ -756,14 +756,19 @@ function formatError(error: unknown): string {
 }
 
 function extractDisplayCode(generatedCode: string): string {
-  const headingMatch = generatedCode.match(/(?:^|\n)###\s+[^\n]+\n```[^\n]*\n([\s\S]*?)```/);
-  if (headingMatch?.[1]) {
-    return trimTrailingNewline(headingMatch[1]);
+  const headingMatches = [...generatedCode.matchAll(/(?:^|\n)###\s+[^\n]+\n```[^\n]*\n([\s\S]*?)```/g)];
+  if (headingMatches.length) {
+    return headingMatches.map((match) => trimTrailingNewline(match[1] ?? "")).filter(Boolean).join("\n\n");
   }
 
-  const labeledMatch = generatedCode.match(/(?:^|\n)(?:File|Path):\s*[^\n]+\n```[^\n]*\n([\s\S]*?)```/);
-  if (labeledMatch?.[1]) {
-    return trimTrailingNewline(labeledMatch[1]);
+  const labeledMatches = [...generatedCode.matchAll(/(?:^|\n)(?:File|Path):\s*[^\n]+\n```[^\n]*\n([\s\S]*?)```/g)];
+  if (labeledMatches.length) {
+    return labeledMatches.map((match) => trimTrailingNewline(match[1] ?? "")).filter(Boolean).join("\n\n");
+  }
+
+  const unfencedSections = extractUnfencedDisplaySections(generatedCode);
+  if (unfencedSections.length) {
+    return unfencedSections.join("\n\n");
   }
 
   const fencedMatch = generatedCode.match(/```[^\n`]*\n([\s\S]*?)```/);
@@ -772,6 +777,29 @@ function extractDisplayCode(generatedCode: string): string {
   }
 
   return generatedCode.trim();
+}
+
+function extractUnfencedDisplaySections(generatedCode: string): string[] {
+  const headingPattern = /(?:^|\n)###\s+([^\n]+)\n/g;
+  const matches = [...generatedCode.matchAll(headingPattern)];
+  if (!matches.length) {
+    return [];
+  }
+
+  const sections: string[] = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const bodyStart = (matches[index].index ?? 0) + matches[index][0].length;
+    const nextStart = matches[index + 1]?.index ?? generatedCode.length;
+    const lines = generatedCode.slice(bodyStart, nextStart).trim().split(/\r?\n/);
+    if (/^(python|typescript|javascript|tsx|jsx|json|markdown|yaml|toml)$/i.test(lines[0]?.trim() ?? "")) {
+      lines.shift();
+    }
+    const section = trimTrailingNewline(lines.join("\n"));
+    if (section) {
+      sections.push(section);
+    }
+  }
+  return sections;
 }
 
 function trimTrailingNewline(value: string): string {

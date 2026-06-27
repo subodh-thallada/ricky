@@ -4,12 +4,12 @@ import json
 from bench.config import get_settings
 from bench.schemas import ConversationMessage, RepoContextConfig
 from bench.services.bench_preview import BenchPreviewService
-from bench.clients.gemini import GeminiClient
+from bench.clients.cerebras import CerebrasClient
 
 
 async def main() -> None:
     settings = get_settings()
-    service = BenchPreviewService(GeminiClient(settings))
+    service = BenchPreviewService(CerebrasClient(settings))
     result = await service.generate_candidates(
         function_name="merge_intervals",
         language="python",

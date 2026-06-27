@@ -191,38 +191,3 @@ class RoutedReplyResponse(BaseModel):
     context_summary: dict[str, object]
 
 
-class FeatureOptionRequest(BaseModel):
-    prompt: str = Field(min_length=1)
-    language: str = "typescript"
-    active_file_name: str | None = None
-    selected_text: str | None = None
-    visible_text: str | None = None
-    repo_context: RepoContextConfig | None = None
-
-
-class FeatureMetricSet(BaseModel):
-    readability: int
-    simplicity: int
-    speed: int
-    memory: int
-    maintainability: int
-    testConfidence: int
-
-
-class FeatureOption(BaseModel):
-    id: str
-    title: str
-    summary: str
-    implementationPlan: str
-    tradeoffs: list[str] = Field(default_factory=list)
-    generatedCode: str
-    metrics: FeatureMetricSet
-
-
-class FeatureOptionResponse(BaseModel):
-    assistantMessage: str
-    contextSummary: str
-    contextMetadata: dict[str, object]
-    geminiModel: str
-    cerebrasModel: str
-    options: list[FeatureOption]

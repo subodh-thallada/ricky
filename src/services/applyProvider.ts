@@ -73,7 +73,7 @@ export class PreviewApplyProvider implements ApplyProvider {
     return {
       optionId: option.id,
       fileCount: session.artifacts.length,
-      summary: `Loaded preview into ${session.artifacts[0]?.displayPath ?? "the active file"} as unsaved changes.`,
+      summary: `${previewSummary("Loaded preview into", session.artifacts)} as unsaved changes.`,
       deactivatedSessionIds
     };
   }
@@ -107,7 +107,7 @@ export class PreviewApplyProvider implements ApplyProvider {
     return {
       optionId: session.optionId,
       fileCount: session.artifacts.length,
-      summary: `Applied preview to ${session.artifacts[0]?.displayPath ?? "the file"} and saved it.`
+      summary: `${previewSummary("Applied preview to", session.artifacts)} and saved changes.`
     };
   }
 
@@ -122,7 +122,7 @@ export class PreviewApplyProvider implements ApplyProvider {
     for (const artifact of session.artifacts) {
       this.fileOwners.delete(artifact.targetUri.toString());
     }
-    return `Restored ${session.artifacts[0]?.displayPath ?? "the file"} to its pre-preview contents.`;
+    return `${previewSummary("Restored", session.artifacts)} to pre-preview contents.`;
   }
 
   hasPendingSession(sessionId: string): boolean {
@@ -139,9 +139,6 @@ export class PreviewApplyProvider implements ApplyProvider {
 
     if (!artifacts.length) {
       throw new Error("Bench could not determine where to preview this code.");
-    }
-    if (artifacts.length > 1) {
-      throw new Error("Bench inline preview currently supports one file at a time. Ask for a narrower change or keep one file focused.");
     }
 
     return {
@@ -164,14 +161,13 @@ export class PreviewApplyProvider implements ApplyProvider {
       }
 
       const targetUri = resolveWorkspacePath(workspaceRoot, artifact.relativePath);
+      const originalContent = await this.readBaseContent(targetUri);
+      const language = artifact.language ?? languageFromPath(artifact.relativePath);
       pending.push({
         targetUri,
         displayPath: normalizeDisplayPath(artifact.relativePath),
-        language: artifact.language ?? languageFromPath(artifact.relativePath),
-        originalContent: await this.readBaseContent(targetUri),
-        proposedContent: artifact.content,
-        previewStartOffset: 0,
-        previewEndOffset: artifact.content.length
+        language,
+        ...buildProposedArtifactState(originalContent, artifact.content, language)
       });
     }
     return pending;
@@ -247,13 +243,11 @@ export class PreviewApplyProvider implements ApplyProvider {
   }
 
   private async showInlinePreview(session: PendingSession): Promise<void> {
-    const artifact = session.artifacts[0];
-    if (!artifact) {
-      return;
+    for (const artifact of session.artifacts) {
+      const document = await this.openArtifactDocument(artifact);
+      await replaceDocumentContents(document, artifact.proposedContent);
+      applyPreviewDecorations(document, artifact);
     }
-    const document = await this.openArtifactDocument(artifact);
-    await replaceDocumentContents(document, artifact.proposedContent);
-    applyPreviewDecorations(document, artifact);
   }
 
   private async revealFirstArtifact(artifact?: PendingArtifact): Promise<void> {
@@ -265,13 +259,11 @@ export class PreviewApplyProvider implements ApplyProvider {
   }
 
   private async restorePreview(session: PendingSession): Promise<void> {
-    const artifact = session.artifacts[0];
-    if (!artifact) {
-      return;
+    for (const artifact of session.artifacts) {
+      const document = await this.openArtifactDocument(artifact);
+      await replaceDocumentContents(document, artifact.originalContent);
+      clearPreviewDecorations(document);
     }
-    const document = await this.openArtifactDocument(artifact);
-    await replaceDocumentContents(document, artifact.originalContent);
-    clearPreviewDecorations(document);
   }
 
   private async openArtifactDocument(artifact: PendingArtifact): Promise<vscode.TextDocument> {
@@ -279,6 +271,58 @@ export class PreviewApplyProvider implements ApplyProvider {
     await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
     return document;
   }
+}
+
+function previewSummary(prefix: string, artifacts: PendingArtifact[]): string {
+  if (artifacts.length === 0) {
+    return `${prefix} the active file`;
+  }
+  if (artifacts.length === 1) {
+    return `${prefix} ${artifacts[0].displayPath}`;
+  }
+  return `${prefix} ${artifacts.length} files (${artifacts.map((artifact) => artifact.displayPath).join(", ")})`;
+}
+
+function buildProposedArtifactState(
+  originalContent: string,
+  code: string,
+  languageId?: string
+): Pick<PendingArtifact, "originalContent" | "proposedContent" | "previewStartOffset" | "previewEndOffset"> {
+  const trimmedCode = trimTrailingWhitespace(code);
+  if (!originalContent) {
+    return {
+      originalContent,
+      proposedContent: trimmedCode,
+      previewStartOffset: 0,
+      previewEndOffset: trimmedCode.length
+    };
+  }
+
+  if (shouldReplaceWholeFile(originalContent, trimmedCode, languageId ?? inferLanguageFromCode(code) ?? "")) {
+    return {
+      originalContent,
+      proposedContent: trimmedCode,
+      previewStartOffset: 0,
+      previewEndOffset: trimmedCode.length
+    };
+  }
+
+  const placement = inferPlacementRange(originalContent, languageId ?? inferLanguageFromCode(code) ?? "", undefined, trimmedCode);
+  return {
+    originalContent,
+    proposedContent: replaceSelection(originalContent, placement.startOffset, placement.endOffset, trimmedCode),
+    previewStartOffset: placement.startOffset,
+    previewEndOffset: placement.startOffset + trimmedCode.length
+  };
+}
+
+function shouldReplaceWholeFile(originalContent: string, generatedContent: string, languageId: string): boolean {
+  const generatedSymbols = extractTopLevelSymbols(generatedContent, languageId);
+  const originalSymbols = new Set(extractTopLevelSymbols(originalContent, languageId).map((symbol) => symbol.name));
+  const overlappingSymbols = generatedSymbols.filter((symbol) => originalSymbols.has(symbol.name));
+  const startsLikeOriginal = firstMeaningfulLine(originalContent) === firstMeaningfulLine(generatedContent);
+
+  return startsLikeOriginal && overlappingSymbols.length >= 2;
 }
 
 function parseExplicitArtifacts(generatedCode: string): ParsedArtifact[] {
@@ -309,7 +353,46 @@ function parseExplicitArtifacts(generatedCode: string): ParsedArtifact[] {
     }));
   }
 
+  const unfencedHeadingArtifacts = parseUnfencedHeadingArtifacts(generatedCode);
+  if (unfencedHeadingArtifacts.length) {
+    return unfencedHeadingArtifacts;
+  }
+
   return [{ content: generatedCode.trim() }];
+}
+
+function parseUnfencedHeadingArtifacts(generatedCode: string): ParsedArtifact[] {
+  const headingPattern = /(?:^|\n)###\s+([^\n]+)\n/g;
+  const matches = [...generatedCode.matchAll(headingPattern)];
+  if (!matches.length) {
+    return [];
+  }
+
+  const artifacts: ParsedArtifact[] = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    const relativePath = match[1]?.trim();
+    if (!relativePath || !looksLikeRelativePath(relativePath)) {
+      continue;
+    }
+
+    const bodyStart = (match.index ?? 0) + match[0].length;
+    const nextStart = matches[index + 1]?.index ?? generatedCode.length;
+    const body = generatedCode.slice(bodyStart, nextStart).trim();
+    if (!body) {
+      continue;
+    }
+
+    const lines = body.split(/\r?\n/);
+    const firstLineLanguage = extractLanguage(lines[0] ?? "");
+    const hasLanguageLead = firstLineLanguage && firstLineLanguage === languageFromPath(relativePath);
+    artifacts.push({
+      relativePath: normalizeDisplayPath(relativePath),
+      language: hasLanguageLead ? firstLineLanguage : languageFromPath(relativePath),
+      content: trimTrailingNewline((hasLanguageLead ? lines.slice(1) : lines).join("\n"))
+    });
+  }
+  return artifacts;
 }
 
 function extractLanguage(fenceInfo: string): string | undefined {
@@ -625,6 +708,39 @@ function extractDeclaredSymbols(code: string): string[] {
     }
   }
   return [...symbols];
+}
+
+type TopLevelSymbol = {
+  name: string;
+  kind: "class" | "function" | "value";
+};
+
+function extractTopLevelSymbols(text: string, languageId: string): TopLevelSymbol[] {
+  const symbols: TopLevelSymbol[] = [];
+  const patterns = languageId === "python"
+    ? [
+        { kind: "function" as const, pattern: /^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm },
+        { kind: "class" as const, pattern: /^class\s+([A-Za-z_][A-Za-z0-9_]*)\b/gm },
+        { kind: "value" as const, pattern: /^([A-Z][A-Z0-9_]*)\s*=/gm }
+      ]
+    : [
+        { kind: "function" as const, pattern: /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm },
+        { kind: "class" as const, pattern: /^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b/gm },
+        { kind: "value" as const, pattern: /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/gm }
+      ];
+
+  for (const { kind, pattern } of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      if (match[1]) {
+        symbols.push({ name: match[1], kind });
+      }
+    }
+  }
+  return symbols;
+}
+
+function firstMeaningfulLine(text: string): string {
+  return text.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
 }
 
 function containsDeclaredSymbol(text: string, languageId: string, symbol: string): boolean {

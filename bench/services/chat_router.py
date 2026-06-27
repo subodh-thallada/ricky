@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from bench.clients.cerebras import CerebrasClient
-from bench.clients.gemini import GeminiClient
 from bench.config import Settings
 
 
@@ -26,7 +25,6 @@ CODE_HINTS = {
 class ChatRouter:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.gemini = GeminiClient(settings)
         self.cerebras = CerebrasClient(settings)
 
     def detect_mode(self, prompt: str, *, intent_hint: str = "auto") -> str:
@@ -38,6 +36,4 @@ class ChatRouter:
         return "text"
 
     def provider_for_mode(self, mode: str) -> tuple[str, object]:
-        if mode == "code":
-            return "cerebras", self.cerebras
-        return "gemini", self.gemini
+        return "cerebras", self.cerebras

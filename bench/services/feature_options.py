@@ -39,7 +39,7 @@ class FeatureOptionsService:
                 assistant_message=_build_assistant_message(len(suggestions)),
                 context_summary=context_summary,
                 context_metadata=context_metadata,
-                gemini_model="local-context-only",
+                gemini_model="disabled-cerebras-only",
                 cerebras_model="cerebras-test-stub",
                 options=[option.model_dump(by_alias=True) for option in suggestions],
             )
@@ -63,7 +63,7 @@ class FeatureOptionsService:
                     "Return code in a shape that helps a local editor heuristic choose the right file "
                     "and replace the right symbol or placeholder."
                 ),
-                "preferFocusedSingleFile": True,
+                "preferMinimalFileSet": True,
             },
         }
         response, suggestions = await self._generate_real_suggestions(user_payload)
@@ -71,7 +71,7 @@ class FeatureOptionsService:
             assistant_message=_build_assistant_message(len(suggestions)),
             context_summary=context_summary,
             context_metadata=context_metadata,
-            gemini_model="local-context-only",
+            gemini_model="disabled-cerebras-only",
             cerebras_model=response.model,
             options=[option.model_dump(by_alias=True) for option in suggestions],
         )
@@ -106,20 +106,33 @@ class FeatureOptionsService:
 
 def _parse_options(content: str) -> list[FeatureOption]:
     cleaned = _strip_outer_json_fence(content)
-    payload = json.loads(cleaned)
-    raw_suggestions = payload.get("suggestions", [])
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        extracted = _extract_json_object(cleaned)
+        if extracted is None:
+            return [_build_raw_code_option(cleaned)]
+        try:
+            payload = json.loads(extracted)
+        except json.JSONDecodeError:
+            return [_build_raw_code_option(cleaned)]
+    if not isinstance(payload, dict):
+        return [_build_raw_code_option(cleaned)]
+    raw_suggestions = payload.get("suggestions", payload.get("options", []))
     if not isinstance(raw_suggestions, list):
-        raise ValueError("Cerebras response did not contain a suggestions array.")
+        return [_build_raw_code_option(cleaned)]
 
     options: list[FeatureOption] = []
     for index, item in enumerate(raw_suggestions[:3]):
+        if not isinstance(item, dict):
+            continue
         normalized = {
             "id": item.get("id") or f"option-{index + 1}",
             "title": item.get("title") or f"Option {index + 1}",
             "summary": item.get("summary") or "",
             "implementationPlan": item.get("implementationPlan") or "",
-            "tradeoffs": item.get("tradeoffs") or [],
-            "generatedCode": item.get("generatedCode") or "",
+            "tradeoffs": _normalize_tradeoffs(item.get("tradeoffs")),
+            "generatedCode": str(item.get("generatedCode") or ""),
         }
         option = FeatureOption.model_validate(
             {
@@ -135,7 +148,7 @@ def _parse_options(content: str) -> list[FeatureOption]:
         if option.title and generated_code:
             options.append(option)
     if not options:
-        raise ValueError("Cerebras returned no usable implementation options.")
+        return [_build_raw_code_option(cleaned)]
     return options
 
 
@@ -145,6 +158,39 @@ def _strip_outer_json_fence(content: str) -> str:
     if match:
         return match.group(1).strip()
     return cleaned
+
+
+def _extract_json_object(content: str) -> str | None:
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return content[start : end + 1].strip()
+
+
+def _build_raw_code_option(content: str) -> FeatureOption:
+    return FeatureOption.model_validate(
+        {
+            "id": "cerebras-draft",
+            "title": "Cerebras draft",
+            "summary": "Use the direct code-shaped response from Cerebras when it did not return structured JSON.",
+            "implementationPlan": "Review the generated code in the details pane, then preview it in the editor before accepting.",
+            "tradeoffs": [
+                "Avoids dropping a useful real response",
+                "May have less structured comparison data than a fully formatted response",
+            ],
+            "generatedCode": content.strip(),
+            "metrics": _build_metrics("Cerebras draft", content[:160], 0).model_dump(by_alias=True),
+        }
+    )
+
+
+def _normalize_tradeoffs(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
@@ -170,9 +216,9 @@ def _build_system_prompt(*, require_min_options: int, strict: bool) -> str:
         "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
         "### relative/path.ext\n```language\n...code...\n```\n"
         "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
-        "You may create a new file when that is the cleanest implementation. If you do, always use an explicit workspace-relative path.\n"
+        "You may create a new file or return changes across multiple files when that is the cleanest implementation. If you do, always use explicit workspace-relative paths for every file.\n"
         "Placement rules for generatedCode:\n"
-        "- Prefer one focused file when possible so Bench can preview inline.\n"
+        "- Prefer the smallest useful set of files; one focused file is best when it is enough, but multi-file output is allowed when needed.\n"
         "- If a focused file or active file already appears to contain the target function/class/placeholder, align the code to that file and that symbol.\n"
         "- If you define a function or class, use the real intended symbol name so Bench can match and replace the correct block locally.\n"
         "- If you are changing a stub, replace the stub with the final implementation instead of returning surrounding commentary.\n"

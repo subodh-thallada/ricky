@@ -80,8 +80,7 @@ class BenchPreviewService:
             CandidatePreview(
                 slot="agent",
                 objective="Original implementation from the coding agent.",
-                model=getattr(self.llm_client.settings, "gemini_model", None)
-                or getattr(self.llm_client.settings, "cerebras_model", "unknown"),
+                model=getattr(self.llm_client.settings, "cerebras_model", "unknown"),
                 rationale="Seed candidate used as slot 0.",
                 code=agent_code,
             ),
@@ -89,8 +88,7 @@ class BenchPreviewService:
         ]
         return BenchRunPreviewResponse(
             function_name=function_name,
-            model=getattr(self.llm_client.settings, "gemini_model", None)
-            or getattr(self.llm_client.settings, "cerebras_model", "unknown"),
+            model=getattr(self.llm_client.settings, "cerebras_model", "unknown"),
             candidates=candidates,
             context_summary=context_summary,
         )
