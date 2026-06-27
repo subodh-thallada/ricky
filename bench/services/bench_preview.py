@@ -54,6 +54,8 @@ class BenchPreviewService:
             "conversation_messages_stored": len(conversation_history),
             "conversation_messages_sent": 0,
             "repo_context_included": False,
+            "focus_paths": repo_context.focus_paths if repo_context else [],
+            "query": repo_context.query if repo_context else "",
         }
         if repo_context is not None:
             repo_snapshot, repo_summary = build_repo_context(repo_context)

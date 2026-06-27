@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bench — live demo on VS Code (runs on your agent's output)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --titlebar:#323233; --activity:#2d2d2e; --side:#252526; --editor:#1e1e1e;
+    --tabbar:#252526; --tabact:#1e1e1e; --status:#0078c8; --statusbench:#7c3aed;
+    --bd:#1b1b1b; --bd2:#333338; --tx:#cccccc; --dim:#8a8a93; --dimmer:#6a6a73;
+    --sel:rgba(38,79,120,.42); --hover:#2a2d2e;
+    --kw:#569cd6; --cf:#c586c0; --fn:#dcdcaa; --var:#9cdcfe; --str:#ce9178;
+    --num:#b5cea8; --com:#6a9955; --ty:#4ec9b0;
+    --pass:#73c991; --fail:#f14c4c; --warn:#cca700; --claude:#e0a072;
+    --grad:linear-gradient(120deg,#8b6bff,#19e3ff);
+    --mono:'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:'Inter',system-ui,sans-serif;background:#0a0a0f;color:var(--tx);
+    display:grid;place-items:center;padding:16px;-webkit-font-smoothing:antialiased}
+
+  .win{width:100%;max-width:1360px;height:min(90vh,880px);display:grid;
+    grid-template-rows:36px 1fr 24px;border-radius:11px;overflow:hidden;
+    background:var(--editor);border:1px solid #000;box-shadow:0 40px 120px -30px rgba(0,0,0,.85)}
+
+  .title{background:var(--titlebar);display:flex;align-items:center;padding:0 14px;gap:14px;position:relative}
+  .traffic{display:flex;gap:8px}.tl{width:12px;height:12px;border-radius:50%}
+  .tl.r{background:#ff5f57}.tl.y{background:#febc2e}.tl.g{background:#28c840}
+  .ttext{position:absolute;left:0;right:0;text-align:center;font-size:12.5px;color:var(--dim);pointer-events:none}
+  .replay{margin-left:auto;font-size:11.5px;color:#cfcfd6;border:1px solid var(--bd2);background:#2a2a2e;
+    border-radius:6px;padding:4px 11px;cursor:pointer;display:flex;align-items:center;gap:6px;z-index:2}
+  .replay:hover{background:#37373d}
+
+  .main{display:grid;grid-template-columns:48px 232px 1fr;min-height:0}
+
+  .activity{background:var(--activity);display:flex;flex-direction:column;align-items:center;padding:8px 0;gap:4px}
+  .ab{width:48px;height:42px;display:grid;place-items:center;color:var(--dim);position:relative;cursor:pointer}
+  .ab:hover{color:#fff}.ab svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.6}
+  .ab.on{color:#fff}.ab.on::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:2px;background:#fff}
+  .ab.bench.on::before{background:linear-gradient(#8b6bff,#19e3ff)}.ab.bench.on{color:#c9b6ff}
+  .ab.spacer{flex:1}
+
+  .side{background:var(--side);border-right:1px solid var(--bd);display:flex;flex-direction:column;min-height:0}
+  .side .head{font-size:11px;letter-spacing:.6px;color:var(--dim);padding:12px 18px 8px;display:flex;justify-content:space-between}
+  .ws{font-size:11px;font-weight:600;letter-spacing:.5px;color:#bbbbc2;padding:4px 14px;display:flex;align-items:center;gap:5px}
+  .tree{font-size:13px;padding:2px 0;overflow:auto}
+  .row{display:flex;align-items:center;gap:6px;padding:3px 8px 3px 14px;cursor:pointer;color:#cfcfd6;white-space:nowrap}
+  .row:hover{background:var(--hover)}.row.sel{background:#37373d}
+  .chev{color:var(--dim);width:13px;text-align:center;font-size:10px}
+  .fi.py{color:#5ca0d8}.fi.md{color:#7a8290}.folder{color:#c9a36a}
+  .dotmod{margin-left:auto;color:#c08a3e;font-size:16px;padding-right:6px}
+
+  .ed{display:grid;grid-template-rows:1fr 232px;min-width:0;min-height:0;background:var(--editor)}
+  .split{display:grid;grid-template-columns:1.05fr 1fr;min-height:0;border-bottom:1px solid var(--bd)}
+  @media(max-width:1120px){.main{grid-template-columns:48px 1fr}.side{display:none}}
+  @media(max-width:920px){.split{grid-template-columns:1fr}}
+
+  .pane{display:grid;grid-template-rows:35px auto 1fr;min-width:0;min-height:0;border-right:1px solid var(--bd)}
+  .pane:last-child{border-right:none}
+  .tabs{background:var(--tabbar);display:flex;align-items:stretch;border-bottom:1px solid var(--bd)}
+  .tab{display:flex;align-items:center;gap:8px;padding:0 14px;font-size:12.5px;color:var(--dim);
+    background:var(--tabbar);border-right:1px solid var(--bd);cursor:pointer;position:relative}
+  .tab.on{background:var(--tabact);color:#fff}
+  .tab.on::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:var(--statusbench)}
+  .tab.code.on::before{background:#0078c8}
+  .tab .x{color:var(--dimmer);font-size:14px}
+  .tab .dotb{width:8px;height:8px;border-radius:50%;background:var(--grad)}
+  .tab .modot{width:8px;height:8px;border-radius:50%;background:#cfcfd6}
+  .breadcrumb{font-size:11.5px;color:var(--dim);padding:5px 16px;background:var(--editor);border-bottom:1px solid #232323}
+  .breadcrumb .sep{color:var(--dimmer)}
+
+  .code{font-family:var(--mono);font-size:13px;line-height:1.6;overflow:auto;padding:6px 0 16px}
+  .ln{display:flex;align-items:flex-start;padding:0 12px 0 0;white-space:pre}
+  .ln:hover{background:#202020}
+  .ln .n{width:40px;min-width:40px;text-align:right;color:#6e7681;padding-right:16px;user-select:none}
+  .ln .t{color:#d4d4d4}
+  .cl{display:flex;white-space:pre;color:var(--statusbench);font-size:11.5px;font-style:italic;padding:3px 0}
+  .cl .n{width:40px;min-width:40px}.cl .lb{color:#19e3ff}.cl .ok{color:var(--pass);font-style:normal}
+  #fn .ln{background:var(--sel);box-shadow:inset 2px 0 0 #0078c8}
+  #fn.flashw .ln{animation:flashw 1.2s ease}
+  #fn.flashg .ln{animation:flashg 1.2s ease}
+  @keyframes flashw{0%{background:rgba(224,160,114,.30)}100%{background:var(--sel)}}
+  @keyframes flashg{0%,30%{background:rgba(115,201,145,.32)}100%{background:var(--sel)}}
+  .kw{color:var(--kw)}.cf{color:var(--cf)}.fn{color:var(--fn)}.var{color:var(--var)}
+  .str{color:var(--str)}.nm2{color:var(--num)}.com{color:var(--com)}.ty{color:var(--ty)}
+
+  /* bench board */
+  .board{display:flex;flex-direction:column;min-height:0;background:var(--editor)}
+  .btool{display:flex;align-items:center;gap:9px;padding:9px 13px;border-bottom:1px solid #232323}
+  .btool .h{font-size:12px;color:#dcdce4}.btool .h b{color:#fff}.btool .grow{flex:1}
+  .trig{font-size:10.5px;color:var(--claude);border:1px solid rgba(224,160,114,.4);border-radius:20px;padding:3px 8px}
+  .tok{font-family:var(--mono);font-size:10.5px;color:#cfc6ff;border:1px solid var(--bd2);border-radius:20px;padding:3px 9px;display:flex;align-items:center;gap:6px}
+  .tok .pulse{width:6px;height:6px;border-radius:50%;background:var(--pass);box-shadow:0 0 8px var(--pass);animation:bp 1.1s infinite}
+  @keyframes bp{50%{opacity:.4}}
+
+  .cards{overflow:auto;padding:11px;display:flex;flex-direction:column;gap:9px;flex:1}
+  .card{border:1px solid var(--bd2);border-radius:8px;background:#232328;padding:10px 11px;position:relative;
+    opacity:0;transform:translateY(8px);transition:.4s}
+  .card.in{opacity:1;transform:none}
+  .card.win{border-color:#5b4bd6;box-shadow:0 0 0 1px rgba(124,92,255,.5),0 6px 24px -8px rgba(124,92,255,.5)}
+  .card.dead{opacity:.6}
+  .card.claude{border-color:rgba(224,160,114,.55)}
+  .crown{position:absolute;top:-1px;right:-1px;font-size:10px;font-weight:600;color:#0a0a14;background:var(--grad);padding:3px 9px;border-radius:0 7px 0 8px;display:none}
+  .card.win .crown{display:block}
+  .ch{display:flex;align-items:center;gap:8px}
+  .cic{width:22px;height:22px;border-radius:6px;background:#2e2e34;border:1px solid var(--bd2);display:grid;place-items:center;font-size:11px}
+  .cn{font-size:13px;font-weight:600;color:#eee;line-height:1.15}
+  .ct{font-size:10.5px;color:var(--dim)}
+  .chip{font-size:9.5px;color:var(--claude);border:1px solid rgba(224,160,114,.45);border-radius:5px;padding:2px 5px;margin-top:3px;display:inline-block}
+  .cb{margin-left:auto;font-family:var(--mono);font-size:10.5px;font-weight:500;padding:3px 7px;border-radius:5px;display:flex;align-items:center;gap:5px;align-self:flex-start}
+  .cb.pass{background:rgba(115,201,145,.15);color:var(--pass)}
+  .cb.fail{background:rgba(241,76,76,.16);color:var(--fail)}
+  .cb.run{background:#2e2e34;color:var(--dim)}
+  .spin{width:11px;height:11px;border-radius:50%;border:2px solid #44444c;border-top-color:#19e3ff;animation:sp .7s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .failln{font-size:10.5px;color:#f1808a;font-family:var(--mono);margin-top:6px}
+  .ms{margin-top:8px;display:flex;flex-direction:column;gap:5px}
+  .m{display:grid;grid-template-columns:48px 1fr 50px;align-items:center;gap:8px}
+  .m .l{font-size:10px;color:var(--dim)}
+  .m .tk{height:5px;border-radius:5px;background:#34343a;overflow:hidden}
+  .m .fl{height:100%;width:0;border-radius:5px;transition:width 1s cubic-bezier(.2,.8,.2,1)}
+  .m .v{font-family:var(--mono);font-size:10.5px;text-align:right;color:#d4d4d4}
+  .good{background:linear-gradient(90deg,#3a9d63,#73c991)}.mid{background:linear-gradient(90deg,#a07d1f,#cca700)}
+  .bad{background:linear-gradient(90deg,#b23a44,#f14c4c)}.dim{background:#4a4a52}
+  .cf2{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .deps{font-size:10px;color:var(--dim);font-family:var(--mono)}
+  .act{margin-left:auto;display:flex;gap:6px}
+  .bt{font-size:11px;border:1px solid var(--bd2);background:transparent;color:#cfcfd6;cursor:pointer;padding:4px 10px;border-radius:6px}
+  .bt:hover{background:#37373d}.bt.pick.on{background:var(--grad);color:#0a0a14;border-color:transparent;font-weight:600}
+
+  .taste{border-top:1px solid #232323;padding:9px 13px}
+  .taste .tt{font-size:10px;letter-spacing:.5px;color:var(--dim);margin-bottom:8px;display:flex;justify-content:space-between}
+  .tgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px 14px}
+  .tm .top{display:flex;justify-content:space-between;font-size:10.5px;color:#cfcfd6;margin-bottom:3px}
+  .tm .top b{font-family:var(--mono);color:#fff;font-weight:500}
+  .tm .bar{height:5px;border-radius:5px;background:#34343a;overflow:hidden}
+  .tm .bar span{display:block;height:100%;width:0;background:var(--grad);border-radius:5px;transition:width .8s cubic-bezier(.2,.8,.2,1)}
+
+  /* bottom panel: Claude Code terminal */
+  .panel{display:grid;grid-template-rows:32px 1fr;min-height:0;background:var(--editor)}
+  .ptabs{display:flex;align-items:center;border-bottom:1px solid var(--bd);padding:0 6px;gap:2px}
+  .pt{font-size:11px;letter-spacing:.4px;color:var(--dim);padding:8px 11px;cursor:pointer;position:relative;text-transform:uppercase}
+  .pt.on{color:#fff}.pt.on::after{content:"";position:absolute;left:11px;right:11px;bottom:0;height:1px;background:#fff}
+  .pt .b{background:#37373d;border-radius:9px;font-size:9px;padding:1px 5px;margin-left:5px;color:#cfcfd6;text-transform:none}
+  .pgrow{flex:1}
+  .pico{color:var(--dim);font-size:13px;padding:0 6px;cursor:pointer}
+  .term{font-family:var(--mono);font-size:12.3px;line-height:1.65;overflow:auto;padding:9px 14px}
+  .term .l{white-space:pre-wrap;opacity:0;animation:lf .25s forwards}
+  @keyframes lf{to{opacity:1}}
+  .term .u{color:#cfcfd6}.term .u b{color:#73c991}
+  .term .a{color:#e6e6ea}.term .a .dot{color:var(--claude)}
+  .term .tool{color:#8a8a93}.term .tool .tree{color:#5a5a63}
+  .term .hook{color:#c9b6ff}.term .hook .lb{color:#19e3ff}
+  .term .ok{color:var(--pass)}
+  .term .res{border:1px solid #3a3a64;border-left:2px solid #7c3aed;border-radius:6px;padding:7px 10px;margin:4px 0;background:rgba(124,92,255,.06);color:#dcdce4}
+  .term .res .star{color:#19e3ff}.term .res .fail{color:var(--fail)}.term .res .me{color:var(--claude)}
+  .term .cursor{display:inline-block;width:7px;height:14px;background:#cfcfd6;vertical-align:-2px;animation:bl 1s steps(1) infinite}
+  @keyframes bl{50%{opacity:0}}
+
+  .status{background:var(--status);display:flex;align-items:center;font-size:11.5px;color:#fff}
+  .status .seg{padding:0 9px;height:24px;display:flex;align-items:center;gap:5px}
+  .status .seg.bench{background:var(--statusbench);cursor:pointer}
+  .status .grow{flex:1}.status .seg:hover{background:rgba(255,255,255,.12)}.status .seg.bench:hover{background:#6d2fd6}
+
+  .toast{position:fixed;bottom:30px;left:50%;transform:translate(-50%,16px);opacity:0;z-index:30;
+    background:#252528;border:1px solid var(--bd2);border-radius:9px;padding:10px 15px;display:flex;gap:10px;align-items:center;
+    box-shadow:0 18px 50px -12px rgba(0,0,0,.7);transition:.35s;max-width:90vw}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+  .toast .ic{width:25px;height:25px;border-radius:7px;background:var(--grad);display:grid;place-items:center;color:#0a0a14;font-weight:700;font-size:13px}
+  .toast .tx{font-size:12.5px;color:#eee}.toast .tx small{display:block;color:var(--dim);font-size:11px}
+  ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#3a3a3f;border:3px solid var(--editor);border-radius:8px}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="title">
+    <div class="traffic"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span></div>
+    <div class="ttext">scheduler.py — bench — Visual Studio Code</div>
+    <button class="replay" id="replay">⟳ Replay demo</button>
+  </div>
+
+  <div class="main">
+    <div class="activity">
+      <div class="ab" title="Explorer"><svg viewBox="0 0 24 24"><path d="M4 5h6l2 2h8v12H4z"/></svg></div>
+      <div class="ab" title="Search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4-4"/></svg></div>
+      <div class="ab" title="Source Control"><svg viewBox="0 0 24 24"><circle cx="7" cy="6" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="9" r="2.5"/><path d="M7 8.5v7M17 11.5c0 3-4 2.5-7 4"/></svg></div>
+      <div class="ab" title="Run and Debug"><svg viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></svg></div>
+      <div class="ab" title="Extensions"><svg viewBox="0 0 24 24"><path d="M5 5h6v6H5zM14 8h5v5h-5zM7 14h5v5H7z"/></svg></div>
+      <div class="ab bench on" title="Bench"><svg viewBox="0 0 24 24"><path d="M13 3L5 14h6l-1 7 8-11h-6z" fill="currentColor" stroke="none"/></svg></div>
+      <div class="ab spacer"></div>
+      <div class="ab" title="Accounts"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.5-4 12-4 14 0"/></svg></div>
+      <div class="ab" title="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 4v3M12 17v3M4 12h3M17 12h3M6 6l2 2M16 16l2 2M18 6l-2 2M8 16l-2 2"/></svg></div>
+    </div>
+
+    <div class="side">
+      <div class="head"><span>EXPLORER</span><span>···</span></div>
+      <div class="ws"><span class="chev">⌄</span>BENCH</div>
+      <div class="tree">
+        <div class="row"><span class="chev">⌄</span><span class="folder">📂</span><span>src</span></div>
+        <div class="row sel" style="padding-left:26px"><span class="fi py">●</span><span>scheduler.py</span><span class="dotmod">•</span></div>
+        <div class="row" style="padding-left:26px"><span class="fi py">●</span><span>rate_limiter.py</span></div>
+        <div class="row" style="padding-left:26px"><span class="fi py">●</span><span>csv_parser.py</span></div>
+        <div class="row"><span class="chev">›</span><span class="folder">📁</span><span>tests</span></div>
+        <div class="row"><span class="chev"></span><span class="fi md">▤</span><span>.mcp.json</span></div>
+        <div class="row"><span class="chev"></span><span class="fi md">▤</span><span>README.md</span></div>
+      </div>
+    </div>
+
+    <div class="ed">
+      <div class="split">
+        <!-- left: code -->
+        <div class="pane">
+          <div class="tabs">
+            <div class="tab code on"><span class="modot"></span>scheduler.py<span class="x">×</span></div>
+          </div>
+          <div class="breadcrumb">src <span class="sep">›</span> scheduler.py <span class="sep">›</span> Scheduler <span class="sep">›</span> merge_intervals</div>
+          <div class="code" id="code"></div>
+        </div>
+        <!-- right: bench board -->
+        <div class="pane">
+          <div class="tabs"><div class="tab on"><span class="dotb"></span>⚡ Bench: merge_intervals<span class="x">×</span></div></div>
+          <div class="board" style="grid-row:2/4">
+            <div class="btool">
+              <span class="trig">▸ triggered by Claude Code</span>
+              <div class="grow"></div>
+              <div class="tok"><span class="pulse"></span>Cerebras <span id="tok">0</span> tok/s</div>
+            </div>
+            <div class="cards" id="cards"></div>
+            <div class="taste">
+              <div class="tt"><span>YOUR TASTE PROFILE</span><span id="learned">12 picks · Backboard</span></div>
+              <div class="tgrid" id="taste"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- bottom panel: Claude Code terminal -->
+      <div class="panel">
+        <div class="ptabs">
+          <div class="pt">Problems</div>
+          <div class="pt">Output</div>
+          <div class="pt on">Terminal <span class="b">claude</span></div>
+          <div class="pt">Ports</div>
+          <div class="pgrow"></div>
+          <span class="pico">⌄</span><span class="pico">✕</span>
+        </div>
+        <div class="term" id="term"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="status">
+    <div class="seg">⎇ main*</div>
+    <div class="seg">✕ 0  ⚠ 0</div>
+    <div class="grow"></div>
+    <div class="seg bench" id="sbench">⚡ Bench: idle</div>
+    <div class="seg">Ln 11, Col 5</div>
+    <div class="seg">Spaces: 4</div>
+    <div class="seg">UTF-8</div>
+    <div class="seg">Python 3.11.4</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"><div class="ic">✓</div><div class="tx" id="ttx">…</div></div>
+
+<script>
+const $=s=>document.querySelector(s);
+
+const HEAD=[
+ '<span class="kw">from</span> typing <span class="kw">import</span> List',
+ '<span class="kw">import</span> heapq',
+ '',
+ '',
+ '<span class="kw">class</span> <span class="ty">Scheduler</span>:',
+ '    <span class="str">"""Merge overlapping busy blocks before planning."""</span>',
+ '',
+ '    <span class="cf">def</span> <span class="fn">busy_blocks</span>(<span class="var">self</span>) -> <span class="ty">List</span>[<span class="kw">list</span>]:',
+ '        <span class="cf">return</span> [<span class="kw">list</span>(<span class="var">b</span>) <span class="cf">for</span> <span class="var">b</span> <span class="cf">in</span> <span class="var">self</span>._raw]',
+ ''
+];
+const PLACEHOLDER=['    <span class="com"># merge_intervals — Claude Code is writing…</span>'];
+
+const BODY={
+ heap:[
+  '    <span class="cf">def</span> <span class="fn">merge_intervals</span>(<span class="var">self</span>, <span class="var">intervals</span>):',
+  '        <span class="var">h</span> = [(<span class="var">s</span>, <span class="var">e</span>) <span class="cf">for</span> <span class="var">s</span>, <span class="var">e</span> <span class="cf">in</span> <span class="var">intervals</span>]',
+  '        <span class="var">heapq</span>.<span class="fn">heapify</span>(<span class="var">h</span>)',
+  '        <span class="var">out</span> = []',
+  '        <span class="cf">while</span> <span class="var">h</span>:',
+  '            <span class="var">s</span>, <span class="var">e</span> = <span class="var">heapq</span>.<span class="fn">heappop</span>(<span class="var">h</span>)',
+  '            <span class="cf">if</span> <span class="var">out</span> <span class="cf">and</span> <span class="var">s</span> &lt;= <span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>]:',
+  '                <span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>] = <span class="fn">max</span>(<span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>], <span class="var">e</span>)',
+  '            <span class="cf">else</span>:',
+  '                <span class="var">out</span>.<span class="fn">append</span>([<span class="var">s</span>, <span class="var">e</span>])',
+  '        <span class="cf">return</span> <span class="var">out</span>'],
+ sweep:[
+  '    <span class="cf">def</span> <span class="fn">merge_intervals</span>(<span class="var">self</span>, <span class="var">intervals</span>):',
+  '        <span class="var">intervals</span>.<span class="fn">sort</span>(key=<span class="cf">lambda</span> <span class="var">x</span>: <span class="var">x</span>[<span class="nm2">0</span>])',
+  '        <span class="var">out</span> = [<span class="var">intervals</span>[<span class="nm2">0</span>]]',
+  '        <span class="cf">for</span> <span class="var">s</span>, <span class="var">e</span> <span class="cf">in</span> <span class="var">intervals</span>[<span class="nm2">1</span>:]:',
+  '            <span class="cf">if</span> <span class="var">s</span> &lt;= <span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>]:',
+  '                <span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>] = <span class="fn">max</span>(<span class="var">out</span>[-<span class="nm2">1</span>][<span class="nm2">1</span>], <span class="var">e</span>)',
+  '            <span class="cf">else</span>:',
+  '                <span class="var">out</span>.<span class="fn">append</span>([<span class="var">s</span>, <span class="var">e</span>])',
+  '        <span class="cf">return</span> <span class="var">out</span>']
+};
+
+// board candidates — slot 0 is Claude's version (heap)
+const V=[
+ {id:'heap',claude:true,name:'Heap / priority queue',ic:'▲',tag:'what the agent wrote',pass:true,tests:'14/14',deps:'1 stdlib',
+   m:[['Runtime','1.3ms',9,'good'],['Memory','78KB',100,'bad'],['Lines','17',100,'mid']]},
+ {id:'sweep',win:true,name:'Sort + sweep',ic:'⚡',tag:'generated · idiomatic',pass:true,tests:'14/14',deps:'0 deps',
+   m:[['Runtime','0.8ms',6,'good'],['Memory','41KB',53,'good'],['Lines','9',53,'good']]},
+ {id:'brute',name:'Brute force',ic:'■',tag:'generated · O(n²)',pass:true,tests:'14/14',deps:'0 deps',
+   m:[['Runtime','14.6ms',100,'bad'],['Memory','38KB',49,'good'],['Lines','11',65,'mid']]},
+ {id:'stack',name:'Stack based',ic:'◆',tag:'generated · clever',pass:false,tests:'12/14',fail:'IndexError on []  ·  wrong on single',deps:'0 deps',
+   m:[['Runtime','0.9ms',6,'dim'],['Memory','40KB',51,'dim'],['Lines','14',82,'dim']]}
+];
+const TASTE=[['Readable',70,90],['Fast',58,62],['Lean',45,47],['Simple',64,86]];
+
+function renderCode(bodyArr){
+  let h='';
+  HEAD.forEach(l=>h+=`<div class="ln"><span class="n"></span><span class="t">${l}</span></div>`);
+  h+=`<div class="cl"><span class="n"></span><span><span class="lb">⚡</span> <span id="lenstxt">Bench watches functions Claude writes here</span></span></div>`;
+  h+=`<div id="fn">`;
+  (bodyArr||PLACEHOLDER).forEach(l=>h+=`<div class="ln"><span class="n"></span><span class="t">${l}</span></div>`);
+  h+=`</div>`;
+  $('#code').innerHTML=h;
+  let n=1; document.querySelectorAll('#code .ln .n').forEach(el=>el.textContent=n++);
+}
+function renderCards(){
+  $('#cards').innerHTML=V.map(v=>`<div class="card ${v.claude?'claude':''}" id="c-${v.id}">
+    <div class="crown">★ #1 for you</div>
+    <div class="ch"><div class="cic">${v.ic}</div>
+      <div><div class="cn">${v.name}</div><div class="ct">${v.tag}</div>${v.claude?'<span class="chip">✦ Claude’s version · slot 0</span>':''}</div>
+      <div class="cb run" id="b-${v.id}">queued</div></div>
+    <div id="f-${v.id}"></div>
+    <div class="ms">${v.m.map(m=>`<div class="m"><span class="l">${m[0]}</span>
+      <div class="tk"><span class="fl ${m[3]}" data-w="${m[2]}"></span></div><span class="v">${m[1]}</span></div>`).join('')}</div>
+    <div class="cf2"><span class="deps">${v.deps}</span>
+      <div class="act"><button class="bt pick" data-pick="${v.id}">Pick</button></div></div>
+  </div>`).join('');
+  $('#taste').innerHTML=TASTE.map(t=>`<div class="tm"><div class="top">${t[0]} <b id="tv-${t[0]}">${t[1]}</b></div>
+    <div class="bar"><span id="tb-${t[0]}"></span></div></div>`).join('');
+  setTaste(false);
+  document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>pick(b.dataset.pick,true));
+}
+function setTaste(p){TASTE.forEach(t=>{$('#tb-'+t[0]).style.width=(p?t[2]:t[1])+'%';$('#tv-'+t[0]).textContent=p?t[2]:t[1];});}
+function animNum(el,to,d){const s=performance.now();(function f(t){let p=Math.min(1,(t-s)/d);el.textContent=Math.round(to*(1-Math.pow(1-p,3)));if(p<1)requestAnimationFrame(f);})(performance.now());}
+
+// terminal helpers
+let termQ=[];
+function tline(html,cls,delay){return {html,cls:cls||'',delay:delay||500};}
+function pushLine(html,cls){const d=document.createElement('div');d.className='l '+(cls||'');d.innerHTML=html;$('#term').appendChild(d);$('#term').scrollTop=$('#term').scrollHeight;return d;}
+function typeLine(html,cls,cb){const d=pushLine('',cls);d.style.opacity=1;let i=0;const plain=html;
+  (function t(){ d.innerHTML=plain.slice(0,i)+'<span class="cursor"></span>'; i++; if(i<=plain.length){setTimeout(t,18);} else {d.innerHTML=plain; cb&&cb();} })();}
+
+let timers=[];
+function clearTimers(){timers.forEach(clearTimeout);timers=[];}
+function at(ms,fn){timers.push(setTimeout(fn,ms));}
+
+let running=false;
+function runDemo(){
+  clearTimers(); running=true;
+  $('#term').innerHTML=''; renderCode(null); renderCards();
+  $('#sbench').textContent='⚡ Bench: idle'; $('#tok').textContent='0';
+  $('#learned').textContent='12 picks · Backboard';
+
+  // 1) user prompt typed
+  at(300,()=>typeLine('> add merge_intervals to Scheduler','u'));
+  // 2) claude responds + writes heap
+  at(1700,()=>pushLine('<span class="dot">⏺</span> I’ll add <b>merge_intervals</b> using a heap for clean streaming merges.','a'));
+  at(2500,()=>{ pushLine('<span class="dot">⏺</span> <span style="color:#cfcfd6">Write</span>(src/scheduler.py)  <span class="tree">⎿</span>  +17 lines','tool');
+    renderCode(BODY.heap); const fn=$('#fn'); fn.classList.add('flashw'); setTimeout(()=>fn.classList.remove('flashw'),1200);
+    $('#lenstxt').textContent='Claude wrote this · benching…'; $('#sbench').textContent='⚡ Bench: benching…'; });
+  // 3) hook fires bench
+  at(3500,()=>pushLine('<span class="lb">⚡</span> bench ▸ <b>PostToolUse</b> hook — benching merge_intervals against 3 alternatives…','hook'));
+  // 4) board runs
+  at(3900,()=>boardRun());
+  // 5) bench result injected back to claude
+  at(8200,()=>{ pushLine(
+    '<div class="res">'+
+    '<span class="lb">⚡</span> bench ▸ 4 options measured in <b>4.1s</b> · Cerebras 2,140 tok/s<br>'+
+    '&nbsp;&nbsp;<span class="star">①</span> sort + sweep&nbsp;&nbsp;14/14 &nbsp;0.8ms &nbsp;&nbsp;9 LOC &nbsp;<span class="star">★ best</span><br>'+
+    '&nbsp;&nbsp;② <span class="me">your heap</span>&nbsp;&nbsp;&nbsp;&nbsp;14/14 &nbsp;1.3ms &nbsp;17 LOC<br>'+
+    '&nbsp;&nbsp;③ brute force&nbsp;&nbsp;14/14 &nbsp;14.6ms &nbsp;11 LOC<br>'+
+    '&nbsp;&nbsp;<span class="fail">✕</span> stack&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;12/14 &nbsp;<span class="fail">IndexError on []</span><br>'+
+    '&nbsp;&nbsp;→ sort+sweep is simpler &amp; <b>1.6× faster</b> than your heap. Review on the board →'+
+    '</div>','');
+  });
+  // 6) auto-pick the winner (sort+sweep) after a beat
+  at(10200,()=>pick('sweep',false));
+}
+
+function boardRun(){
+  animNum($('#tok'),2140,1100); $('#sbench').textContent='⚡ Bench: running 4 sandboxes';
+  V.forEach((v,i)=>at(0+i*120,()=>{$('#c-'+v.id).classList.add('in');
+    $('#b-'+v.id).className='cb run';$('#b-'+v.id).innerHTML='<span class="spin"></span> '+(v.claude?'agent code':'sandbox');}));
+  V.forEach((v,i)=>at(700+i*110,()=>{$('#b-'+v.id).innerHTML='<span class="spin"></span> '+v.tests.split('/')[1]+' tests';}));
+  V.forEach((v,i)=>at(1500+i*230,()=>{const b=$('#b-'+v.id);
+    if(v.pass){b.className='cb pass';b.textContent='✓ '+v.tests;}
+    else{b.className='cb fail';b.textContent='✕ '+v.tests;$('#f-'+v.id).innerHTML='<div class="failln">✕ '+v.fail+'</div>';$('#c-'+v.id).classList.add('dead');}
+    $('#c-'+v.id).querySelectorAll('.fl').forEach(f=>{f.style.width=f.dataset.w+'%';if(!v.pass)f.className='fl dim';});}));
+  at(2900,()=>{$('#c-sweep').classList.add('win');$('#sbench').textContent='⚡ Bench: 4 options · 4.1s';});
+}
+
+function pick(id,manual){
+  const v=V.find(x=>x.id===id);
+  document.querySelectorAll('.card').forEach(c=>c.classList.remove('win'));
+  document.querySelectorAll('.bt.pick').forEach(b=>{b.classList.remove('on');b.textContent='Pick';});
+  const card=$('#c-'+id); card.classList.remove('dead'); card.classList.add('win');
+  const btn=card.querySelector('.bt.pick'); btn.classList.add('on'); btn.textContent='Picked ✓';
+  setTaste(true); $('#learned').textContent='13 picks · saved to Backboard';
+  $('#sbench').textContent='⚡ Bench: picked '+v.name.split(' ')[0].toLowerCase();
+  toast('Learned: readability over cleverness — fed back to Claude Code');
+  // feed back to the agent in the terminal + update file
+  pushLine('<span class="dot">⏺</span> You picked <b style="color:#fff">'+v.name+'</b>'+(v.claude?' (your original).':' — updating scheduler.py.'),'a');
+  if(!v.claude){
+    pushLine('<span class="dot">⏺</span> <span style="color:#cfcfd6">Edit</span>(src/scheduler.py)  <span class="tree">⎿</span>  -17 +'+(id==='sweep'?'9':'?')+' lines','tool');
+    renderCode(BODY[id]||BODY.sweep); const fn=$('#fn'); fn.classList.add('flashg'); setTimeout(()=>fn.classList.remove('flashg'),1200);
+  }
+  $('#lenstxt').innerHTML='Benched · '+v.name+' <span class="ok">✓ verified</span>';
+  pushLine('<span class="ok">✓</span> done — continuing with the verified choice.','ok');
+  if(running&&!manual) running=false;
+}
+let tt;function toast(m){$('#ttx').innerHTML=m+'<small>Bench · Cerebras + Docker + Backboard</small>';$('#toast').classList.add('show');clearTimeout(tt);tt=setTimeout(()=>$('#toast').classList.remove('show'),3400);}
+
+$('#replay').onclick=runDemo; $('#sbench').onclick=runDemo;
+runDemo();
+</script>
+</body>
+</html>

@@ -8,6 +8,8 @@ from bench.schemas import (
     BenchRunPreviewResponse,
     BenchRunRequest,
     ConversationMessage,
+    FeatureOptionsRequest,
+    FeatureOptionsResponse,
     RoutedReplyResponse,
     StoredThread,
     ThreadBenchPreviewRequest,
@@ -17,6 +19,8 @@ from bench.schemas import (
 )
 from bench.services.bench_preview import BenchPreviewService
 from bench.services.chat_router import ChatRouter
+from bench.services.context_inference import infer_repo_context
+from bench.services.feature_options import FeatureOptionsService
 from bench.services.thread_store import ThreadStore
 from bench.services.thread_chat import ThreadChatService
 
@@ -53,13 +57,28 @@ async def providers_check() -> dict[str, object]:
 async def bench_preview(request: BenchRunRequest) -> BenchRunPreviewResponse:
     settings = get_settings()
     service = BenchPreviewService(_build_llm_client(settings))
+    repo_context = infer_repo_context(
+        prompt=f"{request.function_name} {request.surrounding_context}",
+        root_path=".",
+        repo_context=request.repo_context,
+        editor_context=request.editor_context,
+    )
     return await service.generate_candidates(
         function_name=request.function_name,
         language=request.language,
         agent_code=request.agent_code,
         surrounding_context=request.surrounding_context,
         conversation_history=request.conversation_history,
-        repo_context=request.repo_context,
+        repo_context=repo_context,
+    )
+
+
+@app.post("/feature-options", response_model=FeatureOptionsResponse)
+async def feature_options(request: FeatureOptionsRequest) -> FeatureOptionsResponse:
+    settings = get_settings()
+    service = FeatureOptionsService(CerebrasClient(settings))
+    return await service.generate(
+        request,
     )
 
 
@@ -104,6 +123,14 @@ async def reply_in_thread(
 
     if request.repo_context is not None:
         thread = thread_store.update_repo_context(thread_id, request.repo_context)
+    elif thread.repo_context is None:
+        inferred = infer_repo_context(
+            prompt=request.prompt,
+            root_path=".",
+            repo_context=None,
+            editor_context=request.editor_context,
+        )
+        thread = thread_store.update_repo_context(thread_id, inferred)
 
     prior_history = list(thread.messages)
     thread = thread_store.append_message(
@@ -139,6 +166,14 @@ async def bench_preview_for_thread(
 
     if request.repo_context is not None:
         thread = thread_store.update_repo_context(thread_id, request.repo_context)
+    elif thread.repo_context is None:
+        inferred = infer_repo_context(
+            prompt=f"{request.function_name} {request.surrounding_context}",
+            root_path=".",
+            repo_context=None,
+            editor_context=request.editor_context,
+        )
+        thread = thread_store.update_repo_context(thread_id, inferred)
 
     if request.append_messages:
         thread = thread_store.append_messages(thread_id, request.append_messages)
