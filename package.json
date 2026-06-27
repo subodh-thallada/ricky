@@ -67,9 +67,9 @@
                                   }
                     },
     "scripts":  {
-                    "compile":  "tsc -p ./",
-                    "watch":  "tsc -watch -p ./",
-                    "lint":  "tsc --noEmit -p ./",
+                    "compile":  "node ./node_modules/typescript/bin/tsc -p ./",
+                    "watch":  "node ./node_modules/typescript/bin/tsc -watch -p ./",
+                    "lint":  "node ./node_modules/typescript/bin/tsc --noEmit -p ./",
                     "vscode:prepublish":  "npm run compile"
                 },
     "devDependencies":  {

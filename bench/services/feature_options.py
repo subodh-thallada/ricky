@@ -1,258 +1,268 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-from dataclasses import dataclass
-from typing import Any
 
 from bench.clients.cerebras import CerebrasClient
-from bench.clients.gemini import GeminiClient
-from bench.config import Settings
 from bench.schemas import (
-    FeatureMetricSet,
+    BenchMetricSet,
+    EditorContext,
     FeatureOption,
-    FeatureOptionRequest,
-    FeatureOptionResponse,
+    FeatureOptionsRequest,
+    FeatureOptionsResponse,
 )
+from bench.services.context_inference import infer_repo_context
 from bench.services.repo_context import build_repo_context
 
 
-@dataclass
 class FeatureOptionsService:
-    settings: Settings
+    def __init__(self, cerebras: CerebrasClient):
+        self.cerebras = cerebras
 
-    def __post_init__(self) -> None:
-        self.gemini = GeminiClient(self.settings)
-        self.cerebras = CerebrasClient(self.settings)
-
-    async def generate(self, request: FeatureOptionRequest) -> FeatureOptionResponse:
-        repo_snapshot, context_metadata = self._repo_snapshot(request)
-        gemini_plan = await self._gemini_plan(request, repo_snapshot)
-        plans = _normalize_plans(gemini_plan)
-        code_results = await asyncio.gather(
-            *[self._cerebras_code(request, gemini_plan["contextSummary"], plan) for plan in plans]
+    async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
+        inferred_context = infer_repo_context(
+            prompt=request.prompt,
+            root_path=request.repo_context.root_path if request.repo_context else ".",
+            repo_context=request.repo_context,
+            editor_context=_request_to_editor_context(request),
         )
+        repo_snapshot, context_metadata = build_repo_context(inferred_context)
+        context_summary = _make_context_summary(context_metadata)
 
-        options = [
-            FeatureOption(
-                id=plan["id"],
-                title=plan["title"],
-                summary=plan["summary"],
-                implementationPlan=plan["implementationPlan"],
-                tradeoffs=plan["tradeoffs"],
-                generatedCode=code,
-                metrics=FeatureMetricSet(**plan["metrics"]),
+        if "(test)" in request.prompt.lower():
+            suggestions = _build_test_options(request.prompt)
+            return FeatureOptionsResponse(
+                assistant_message=_build_assistant_message(len(suggestions)),
+                context_summary=context_summary,
+                context_metadata=context_metadata,
+                gemini_model="local-context-only",
+                cerebras_model="cerebras-test-stub",
+                options=suggestions,
             )
-            for plan, code in zip(plans, code_results, strict=True)
-        ]
 
-        return FeatureOptionResponse(
-            assistantMessage=gemini_plan["assistantMessage"],
-            contextSummary=gemini_plan["contextSummary"],
-            contextMetadata=context_metadata,
-            geminiModel=gemini_plan["geminiModel"],
-            cerebrasModel=self.settings.cerebras_model,
-            options=options,
+        system_prompt = (
+            "You are Bench, a VS Code coding assistant.\n"
+            "Given a user's feature request and optional editor context, return 3 or 4 genuinely different implementation options.\n"
+            "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
+            "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
+            'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
+            '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
         )
-
-    def _repo_snapshot(self, request: FeatureOptionRequest) -> tuple[str, dict[str, object]]:
-        parts: list[str] = []
-        metadata: dict[str, object] = {
-            "active_file_name": request.active_file_name,
-            "repo_context_included": False,
-        }
-        if request.selected_text:
-            parts.append(f"SELECTED TEXT:\n{request.selected_text}")
-        if request.visible_text:
-            parts.append(f"VISIBLE EDITOR TEXT:\n{request.visible_text[:6000]}")
-        if request.repo_context is not None:
-            repo_snapshot, repo_metadata = build_repo_context(request.repo_context)
-            if repo_snapshot:
-                parts.append(f"REPOSITORY SNIPPETS:\n{repo_snapshot}")
-                metadata.update(repo_metadata)
-                metadata["repo_context_included"] = True
-        return "\n\n".join(parts), metadata
-
-    async def _gemini_plan(self, request: FeatureOptionRequest, repo_snapshot: str) -> dict[str, Any]:
-        system = (
-            "You are Bench's Gemini planning layer. You talk to the user, condense codebase context, "
-            "design implementation options, and assign mock metrics. You do not write final code. "
-            "Return only valid JSON with no Markdown."
-        )
-        user = {
+        user_payload = {
             "featureRequest": request.prompt,
-            "language": request.language,
-            "activeFileName": request.active_file_name,
-            "repoSnapshot": repo_snapshot,
-            "requiredJsonShape": {
-                "assistantMessage": "friendly concise reply to the user",
-                "contextSummary": "condensed codebase context for Cerebras",
-                "options": [
-                    {
-                        "id": "stable-kebab-id",
-                        "title": "option title",
-                        "summary": "short user-facing summary",
-                        "implementationPlan": "specific implementation plan, but no code",
-                        "tradeoffs": ["tradeoff"],
-                        "metrics": {
-                            "readability": 80,
-                            "simplicity": 80,
-                            "speed": 80,
-                            "memory": 80,
-                            "maintainability": 80,
-                            "testConfidence": 80,
-                        },
-                    }
-                ],
+            "workspaceContext": {
+                "activeFileName": request.active_file_name,
+                "languageId": request.language,
+                "selectedText": request.selected_text,
+                "visibleText": request.visible_text,
             },
-        }
-        response = await self.gemini.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user)},
-            ],
-            max_completion_tokens=1800,
-            temperature=0.2,
-        )
-        payload = _parse_json_object(response.text or "")
-        payload["geminiModel"] = response.model
-        return payload
-
-    async def _cerebras_code(
-        self,
-        request: FeatureOptionRequest,
-        context_summary: str,
-        plan: dict[str, Any],
-    ) -> str:
-        system = (
-            "You are Bench's Cerebras code writer. Write code only. "
-            "Do not produce metrics, conversation, or analysis. "
-            "Return a single code artifact with no Markdown fence."
-        )
-        user = {
-            "featureRequest": request.prompt,
-            "language": request.language,
-            "activeFileName": request.active_file_name,
-            "condensedContextFromGemini": context_summary,
-            "implementationOption": {
-                "title": plan["title"],
-                "summary": plan["summary"],
-                "implementationPlan": plan["implementationPlan"],
-                "tradeoffs": plan["tradeoffs"],
-            },
+            "repositoryContext": repo_snapshot,
         }
         response = await self.cerebras.chat(
             [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload)},
             ],
-            max_completion_tokens=1800,
-            reasoning_effort="low",
-            temperature=0.25,
+            max_completion_tokens=2200,
+            temperature=0.35,
         )
-        return _strip_code_fence(response.text or "")
+        suggestions = _parse_options(response.text or "")
+        return FeatureOptionsResponse(
+            assistant_message=_build_assistant_message(len(suggestions)),
+            context_summary=context_summary,
+            context_metadata=context_metadata,
+            gemini_model="local-context-only",
+            cerebras_model=response.model,
+            options=suggestions,
+        )
 
 
-def _parse_json_object(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        json_text = _extract_first_json_object(cleaned)
-        if json_text is None:
-            raise
-        parsed = json.loads(json_text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Gemini response was not a JSON object.")
-    return parsed
+def _parse_options(content: str) -> list[FeatureOption]:
+    cleaned = content.replace("```json", "").replace("```", "").strip()
+    payload = json.loads(cleaned)
+    raw_suggestions = payload.get("suggestions", [])
+    if not isinstance(raw_suggestions, list):
+        raise ValueError("Cerebras response did not contain a suggestions array.")
 
-
-def _extract_first_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index, char in enumerate(text[start:], start=start):
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
-
-
-def _normalize_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_options = payload.get("options")
-    if not isinstance(raw_options, list) or not raw_options:
-        raise ValueError("Gemini response did not include options.")
-
-    plans: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_options[:4]):
-        if not isinstance(raw, dict):
-            continue
-        title = str(raw.get("title") or f"Option {index + 1}").strip()
-        metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
-        plans.append(
+    options: list[FeatureOption] = []
+    for index, item in enumerate(raw_suggestions[:4]):
+        normalized = {
+            "id": item.get("id") or f"option-{index + 1}",
+            "title": item.get("title") or f"Option {index + 1}",
+            "summary": item.get("summary") or "",
+            "implementationPlan": item.get("implementationPlan") or "",
+            "tradeoffs": item.get("tradeoffs") or [],
+            "generatedCode": item.get("generatedCode") or "",
+        }
+        option = FeatureOption.model_validate(
             {
-                "id": _slug(str(raw.get("id") or title or f"option-{index + 1}"), index),
-                "title": title,
-                "summary": str(raw.get("summary") or "").strip(),
-                "implementationPlan": str(raw.get("implementationPlan") or "").strip(),
-                "tradeoffs": [str(item) for item in raw.get("tradeoffs", []) if str(item).strip()],
-                "metrics": {
-                    "readability": _metric(metrics.get("readability"), 78 + index),
-                    "simplicity": _metric(metrics.get("simplicity"), 74 + index),
-                    "speed": _metric(metrics.get("speed"), 72 + index),
-                    "memory": _metric(metrics.get("memory"), 76 + index),
-                    "maintainability": _metric(metrics.get("maintainability"), 80 + index),
-                    "testConfidence": _metric(metrics.get("testConfidence"), 70 + index),
-                },
+                **normalized,
+                "metrics": _build_metrics(
+                    normalized["title"],
+                    normalized["summary"],
+                    index,
+                ).model_dump(by_alias=True),
             }
         )
-    if not plans:
-        raise ValueError("Gemini response did not include usable options.")
-    return plans
+        if option.title and option.generated_code:
+            options.append(option)
+    if not options:
+        raise ValueError("Cerebras returned no usable implementation options.")
+    return options
 
 
-def _metric(value: Any, fallback: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        number = fallback
-    return max(0, min(100, number))
+def _build_metrics(title: str, summary: str, index: int) -> BenchMetricSet:
+    seed = _hash(f"{title}:{summary}:{index}")
+    metrics = {
+        "readability": 56 + ((seed + index * 17 + 0 * 23) % 39),
+        "simplicity": 56 + ((seed + index * 17 + 1 * 23) % 39),
+        "speed": 56 + ((seed + index * 17 + 2 * 23) % 39),
+        "memory": 56 + ((seed + index * 17 + 3 * 23) % 39),
+        "maintainability": 56 + ((seed + index * 17 + 4 * 23) % 39),
+        "testConfidence": 56 + ((seed + index * 17 + 5 * 23) % 39),
+    }
+    combined = f"{title} {summary}"
+    if any(term in combined.lower() for term in ["simple", "read", "idiom", "maintain"]):
+        metrics["readability"] = min(96, metrics["readability"] + 10)
+        metrics["simplicity"] = min(96, metrics["simplicity"] + 8)
+    if any(term in combined.lower() for term in ["fast", "performance", "cache", "batch", "parallel"]):
+        metrics["speed"] = min(97, metrics["speed"] + 12)
+        metrics["memory"] = max(48, metrics["memory"] - 7)
+    return BenchMetricSet.model_validate(metrics)
 
 
-def _slug(value: str, index: int) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return slug or f"option-{index + 1}"
+def _hash(value: str) -> int:
+    out = 0
+    for char in value:
+        out = (out * 31 + ord(char)) & 0xFFFFFFFF
+    return out
 
 
-def _strip_code_fence(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    return cleaned
+def _make_context_summary(metadata: dict[str, object]) -> str:
+    files = metadata.get("files_included", 0)
+    strategy = metadata.get("strategy", "unknown")
+    cache_hit = metadata.get("cache_hit", False)
+    return f"Using {files} summarized files via {strategy}. Cache hit: {cache_hit}."
+
+
+def _build_assistant_message(option_count: int) -> str:
+    return (
+        f"I generated {option_count} implementation options. "
+        "Context was condensed locally to limit token usage, and mock metrics are attached for now."
+    )
+
+
+def _build_test_options(prompt: str) -> list[FeatureOption]:
+    lowered = prompt.lower()
+    if "fibonacci" in lowered:
+        raw = [
+            {
+                "id": "fibonacci-iterative",
+                "title": "Readable iterative Fibonacci",
+                "summary": "Simple loop-based implementation with explicit state transitions.",
+                "implementationPlan": "Add a small helper function with validation and an iterative loop.",
+                "tradeoffs": ["Very readable", "Not the asymptotically fastest possible approach"],
+                "generatedCode": (
+                    "def fibonacci_iterative(n: int) -> int:\n"
+                    "    if n < 0:\n"
+                    "        raise ValueError('n must be non-negative')\n"
+                    "    if n < 2:\n"
+                    "        return n\n"
+                    "    prev_num, curr_num = 0, 1\n"
+                    "    for _ in range(2, n + 1):\n"
+                    "        prev_num, curr_num = curr_num, prev_num + curr_num\n"
+                    "    return curr_num\n"
+                ),
+            },
+            {
+                "id": "fibonacci-memoized",
+                "title": "Memoized recursive Fibonacci",
+                "summary": "Recursive shape with memoization for repeated subproblems.",
+                "implementationPlan": "Implement a recursive helper with a memo dict seeded with base cases.",
+                "tradeoffs": ["Nice conceptual mapping", "More overhead than iterative for single calls"],
+                "generatedCode": (
+                    "def fibonacci_memoized(n: int, memo: dict[int, int] | None = None) -> int:\n"
+                    "    if n < 0:\n"
+                    "        raise ValueError('n must be non-negative')\n"
+                    "    if memo is None:\n"
+                    "        memo = {0: 0, 1: 1}\n"
+                    "    if n not in memo:\n"
+                    "        memo[n] = fibonacci_memoized(n - 1, memo) + fibonacci_memoized(n - 2, memo)\n"
+                    "    return memo[n]\n"
+                ),
+            },
+            {
+                "id": "fibonacci-fast-doubling",
+                "title": "Fast-doubling Fibonacci",
+                "summary": "More advanced implementation optimized for fewer recursive steps.",
+                "implementationPlan": "Use the fast-doubling recurrence with a tuple-returning helper.",
+                "tradeoffs": ["Fastest for large n", "Harder to understand at a glance"],
+                "generatedCode": (
+                    "def fibonacci_fast_doubling(n: int) -> int:\n"
+                    "    if n < 0:\n"
+                    "        raise ValueError('n must be non-negative')\n"
+                    "    def _fib(k: int) -> tuple[int, int]:\n"
+                    "        if k == 0:\n"
+                    "            return 0, 1\n"
+                    "        a, b = _fib(k >> 1)\n"
+                    "        c = a * ((b << 1) - a)\n"
+                    "        d = a * a + b * b\n"
+                    "        return (d, c + d) if (k & 1) else (c, d)\n"
+                    "    return _fib(n)[0]\n"
+                ),
+            },
+        ]
+    else:
+        slug = _slugify(prompt)
+        raw = [
+            {
+                "id": f"{slug}-simple",
+                "title": "Simple service-first implementation",
+                "summary": "Keep the feature small, explicit, and easy to revise after the first user test.",
+                "implementationPlan": "Add a focused service function, call it from the relevant route or handler, and keep state changes local.",
+                "tradeoffs": ["Fastest to review", "May need another abstraction later"],
+                "generatedCode": "// hardcoded test option 1\nexport async function buildFeature() {\n  return { ok: true };\n}\n",
+            },
+            {
+                "id": f"{slug}-modular",
+                "title": "Modular provider-based implementation",
+                "summary": "Introduce replaceable providers now so future sandbox/apply flows slot in cleanly.",
+                "implementationPlan": "Define provider interfaces for the feature and wire an MVP implementation behind them.",
+                "tradeoffs": ["More extensible", "More structure up front"],
+                "generatedCode": "// hardcoded test option 2\nexport interface FeatureProvider {\n  run(input: string): Promise<unknown>;\n}\n",
+            },
+            {
+                "id": f"{slug}-fast",
+                "title": "Fast path with cached state",
+                "summary": "Bias toward responsiveness by caching repeated work.",
+                "implementationPlan": "Add a small in-memory cache keyed by request context and refresh asynchronously.",
+                "tradeoffs": ["Snappier UX", "Needs careful invalidation later"],
+                "generatedCode": "// hardcoded test option 3\nconst featureCache = new Map<string, unknown>();\n",
+            },
+        ]
+    return [
+        FeatureOption.model_validate(
+            {
+                **item,
+                "metrics": _build_metrics(item["title"], item["summary"], index).model_dump(by_alias=True),
+            }
+        )
+        for index, item in enumerate(raw)
+    ]
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:36] or "feature"
+
+
+def _request_to_editor_context(request: FeatureOptionsRequest) -> EditorContext:
+    visible_files: list[str] = []
+    if request.active_file_name:
+        visible_files.append(request.active_file_name)
+    return EditorContext(
+        active_file=request.active_file_name,
+        selection=request.selected_text or "",
+        visible_files=visible_files,
+        symbol_name=None,
+    )

@@ -51,8 +51,11 @@ class BenchPreviewService:
     ) -> BenchRunPreviewResponse:
         repo_snapshot = ""
         context_summary: dict[str, object] = {
-            "conversation_messages": len(conversation_history),
+            "conversation_messages_stored": len(conversation_history),
+            "conversation_messages_sent": 0,
             "repo_context_included": False,
+            "focus_paths": repo_context.focus_paths if repo_context else [],
+            "query": repo_context.query if repo_context else "",
         }
         if repo_context is not None:
             repo_snapshot, repo_summary = build_repo_context(repo_context)
@@ -127,10 +130,6 @@ class BenchPreviewService:
             user_prompt += f"\nRepository context:\n{repo_snapshot}\n"
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-        messages.extend(
-            {"role": message.role, "content": message.content}
-            for message in conversation_history
-        )
         messages.append({"role": "user", "content": user_prompt})
         response: TextGenerationResult = await self.llm_client.chat(
             messages,
