@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
-import { CerebrasClient } from "./services/cerebrasClient";
-import { MockMetricsProvider } from "./services/mockMetricsProvider";
+import { OrchestratorClient } from "./services/orchestratorClient";
 import { NoopSandboxRunner, SelectionOnlyApplyProvider } from "./services/placeholders";
 import { BenchOption, ChatMessage, WorkspaceContext } from "./types";
 
@@ -20,27 +19,6 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bench.newFeatureChat", async () => {
       await vscode.commands.executeCommand("workbench.view.extension.bench");
       provider.reset();
-    }),
-    vscode.commands.registerCommand("bench.setCerebrasApiKey", async () => {
-      const value = await vscode.window.showInputBox({
-        title: "Set Cerebras API Key",
-        prompt: "Stored in VS Code SecretStorage for Bench.",
-        password: true,
-        ignoreFocusOut: true
-      });
-
-      if (value === undefined) {
-        return;
-      }
-
-      if (!value.trim()) {
-        await context.secrets.delete("bench.cerebrasApiKey");
-        vscode.window.showInformationMessage("Bench Cerebras API key cleared.");
-        return;
-      }
-
-      await context.secrets.store("bench.cerebrasApiKey", value.trim());
-      vscode.window.showInformationMessage("Bench Cerebras API key saved.");
     })
   );
 }
@@ -51,23 +29,20 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "bench.chatView";
 
   private view?: vscode.WebviewView;
-  private readonly cerebras: CerebrasClient;
-  private readonly metricsProvider = new MockMetricsProvider();
+  private readonly orchestrator = new OrchestratorClient();
   private readonly sandboxRunner = new NoopSandboxRunner();
   private readonly applyProvider = new SelectionOnlyApplyProvider();
   private messages: ChatMessage[] = [
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. I will generate a few implementation options, attach mock metrics for now, and let you inspect the details before choosing one."
+      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
     }
   ];
   private options: BenchOption[] = [];
   private selectedOptionId?: string;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
-    this.cerebras = new CerebrasClient(context.secrets);
-  }
+  constructor(private readonly context: vscode.ExtensionContext) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
@@ -94,9 +69,6 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         case "selectOption":
           await this.selectOption(message.optionId);
           break;
-        case "setApiKey":
-          await vscode.commands.executeCommand("bench.setCerebrasApiKey");
-          break;
       }
     });
   }
@@ -121,27 +93,26 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.messages.push({ id: createId("user"), role: "user", content: prompt });
-    this.postState({ loading: true, notice: "Asking Cerebras for implementation options..." });
+    this.postState({ loading: true, notice: "Asking Gemini to plan, then Cerebras to write code..." });
 
     try {
       const workspaceContext = getWorkspaceContext();
-      const suggestions = await this.cerebras.generateSuggestions(prompt, workspaceContext);
-      const optionsWithMetrics = this.metricsProvider.attachMetrics(suggestions);
-      this.options = await this.sandboxRunner.run(optionsWithMetrics);
+      const result = await this.orchestrator.generateFeatureOptions(prompt, workspaceContext);
+      this.options = await this.sandboxRunner.run(result.options);
       this.selectedOptionId = undefined;
       this.messages.push({
         id: createId("assistant"),
         role: "assistant",
-        content: `I generated ${this.options.length} implementation options. Metrics are mocked in this MVP; Docker-backed measurements will plug into the same cards later.`,
+        content: result.message || `I generated ${this.options.length} implementation options. Gemini supplied the chat, context, plans, and mock metrics; Cerebras wrote the code only.`,
         options: this.options
       });
       this.postState();
     } catch (error) {
-      this.options = this.metricsProvider.attachMetrics(buildFallbackSuggestions(prompt));
+      this.options = buildFallbackSuggestions(prompt);
       this.messages.push({
         id: createId("assistant"),
         role: "assistant",
-        content: `I could not reach or parse Cerebras, so I loaded local demo options instead. ${formatError(error)}`,
+        content: `I could not reach the Bench orchestrator, so I loaded local demo options instead. ${formatError(error)}`,
         options: this.options
       });
       this.postState({ error: formatError(error) });
@@ -265,7 +236,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Feature chat with generated options. Metrics are mocked until Docker is wired in.</div>
+      <div class="sub">Gemini chats and scores. Cerebras writes code. Docker metrics come later.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
@@ -308,7 +279,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     function render() {
       sendEl.disabled = Boolean(state.loading);
-      statusEl.textContent = state.loading ? 'Generating options with Cerebras...' : (state.notice || '');
+      statusEl.textContent = state.loading ? 'Gemini planning, Cerebras writing code...' : (state.notice || '');
       statusEl.className = state.error ? 'status error' : 'status';
       messagesEl.innerHTML = '';
 
@@ -462,7 +433,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 }
 
 type WebviewMessage = {
-  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption" | "setApiKey";
+  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption";
   text?: string;
   optionId?: string;
 };
@@ -566,3 +537,6 @@ function createNonce(): string {
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+
+

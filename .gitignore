@@ -5,3 +5,9 @@ dist/
 out/
 .env
 .DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+.bench_threads.json
