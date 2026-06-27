@@ -14,6 +14,7 @@ export class MockMetricsProvider implements MetricsProvider {
     return suggestions.map((suggestion, index) => ({
       ...suggestion,
       selected: false,
+      applyState: "idle",
       metrics: this.buildMetrics(suggestion, index)
     }));
   }

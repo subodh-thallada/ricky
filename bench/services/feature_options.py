@@ -37,6 +37,9 @@ class FeatureOptionsService:
             "You are Bench, a VS Code coding assistant.\n"
             "Given a user's feature request and optional editor context, return 3 or 4 genuinely different implementation options.\n"
             "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
+            "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
+            "### relative/path.ext\n```language\n...code...\n```\n"
+            "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
             "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
             'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
             '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
@@ -156,6 +159,8 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "implementationPlan": "Add a small helper function with validation and an iterative loop.",
                 "tradeoffs": ["Very readable", "Not the asymptotically fastest possible approach"],
                 "generatedCode": (
+                    "### bench_preview/fibonacci_iterative.py\n"
+                    "```python\n"
                     "def fibonacci_iterative(n: int) -> int:\n"
                     "    if n < 0:\n"
                     "        raise ValueError('n must be non-negative')\n"
@@ -165,6 +170,7 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                     "    for _ in range(2, n + 1):\n"
                     "        prev_num, curr_num = curr_num, prev_num + curr_num\n"
                     "    return curr_num\n"
+                    "```"
                 ),
             },
             {
@@ -174,6 +180,8 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "implementationPlan": "Implement a recursive helper with a memo dict seeded with base cases.",
                 "tradeoffs": ["Nice conceptual mapping", "More overhead than iterative for single calls"],
                 "generatedCode": (
+                    "### bench_preview/fibonacci_memoized.py\n"
+                    "```python\n"
                     "def fibonacci_memoized(n: int, memo: dict[int, int] | None = None) -> int:\n"
                     "    if n < 0:\n"
                     "        raise ValueError('n must be non-negative')\n"
@@ -182,6 +190,7 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                     "    if n not in memo:\n"
                     "        memo[n] = fibonacci_memoized(n - 1, memo) + fibonacci_memoized(n - 2, memo)\n"
                     "    return memo[n]\n"
+                    "```"
                 ),
             },
             {
@@ -191,6 +200,8 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "implementationPlan": "Use the fast-doubling recurrence with a tuple-returning helper.",
                 "tradeoffs": ["Fastest for large n", "Harder to understand at a glance"],
                 "generatedCode": (
+                    "### bench_preview/fibonacci_fast_doubling.py\n"
+                    "```python\n"
                     "def fibonacci_fast_doubling(n: int) -> int:\n"
                     "    if n < 0:\n"
                     "        raise ValueError('n must be non-negative')\n"
@@ -202,11 +213,13 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                     "        d = a * a + b * b\n"
                     "        return (d, c + d) if (k & 1) else (c, d)\n"
                     "    return _fib(n)[0]\n"
+                    "```"
                 ),
             },
         ]
     else:
         slug = _slugify(prompt)
+        output_path = _default_output_path(slug)
         raw = [
             {
                 "id": f"{slug}-simple",
@@ -214,7 +227,15 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "summary": "Keep the feature small, explicit, and easy to revise after the first user test.",
                 "implementationPlan": "Add a focused service function, call it from the relevant route or handler, and keep state changes local.",
                 "tradeoffs": ["Fastest to review", "May need another abstraction later"],
-                "generatedCode": "// hardcoded test option 1\nexport async function buildFeature() {\n  return { ok: true };\n}\n",
+                "generatedCode": (
+                    f"### {output_path}\n"
+                    "```ts\n"
+                    "// hardcoded test option 1\n"
+                    "export async function buildFeature() {\n"
+                    "  return { ok: true };\n"
+                    "}\n"
+                    "```"
+                ),
             },
             {
                 "id": f"{slug}-modular",
@@ -222,7 +243,15 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "summary": "Introduce replaceable providers now so future sandbox/apply flows slot in cleanly.",
                 "implementationPlan": "Define provider interfaces for the feature and wire an MVP implementation behind them.",
                 "tradeoffs": ["More extensible", "More structure up front"],
-                "generatedCode": "// hardcoded test option 2\nexport interface FeatureProvider {\n  run(input: string): Promise<unknown>;\n}\n",
+                "generatedCode": (
+                    f"### {output_path}\n"
+                    "```ts\n"
+                    "// hardcoded test option 2\n"
+                    "export interface FeatureProvider {\n"
+                    "  run(input: string): Promise<unknown>;\n"
+                    "}\n"
+                    "```"
+                ),
             },
             {
                 "id": f"{slug}-fast",
@@ -230,7 +259,13 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
                 "summary": "Bias toward responsiveness by caching repeated work.",
                 "implementationPlan": "Add a small in-memory cache keyed by request context and refresh asynchronously.",
                 "tradeoffs": ["Snappier UX", "Needs careful invalidation later"],
-                "generatedCode": "// hardcoded test option 3\nconst featureCache = new Map<string, unknown>();\n",
+                "generatedCode": (
+                    f"### {output_path}\n"
+                    "```ts\n"
+                    "// hardcoded test option 3\n"
+                    "const featureCache = new Map<string, unknown>();\n"
+                    "```"
+                ),
             },
         ]
     return [
@@ -249,6 +284,10 @@ def _slugify(text: str) -> str:
 
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:36] or "feature"
+
+
+def _default_output_path(slug: str) -> str:
+    return f"src/generated/{slug}.ts"
 
 
 def _request_to_editor_context(request: FeatureOptionsRequest) -> EditorContext:

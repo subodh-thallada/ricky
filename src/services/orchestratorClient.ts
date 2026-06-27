@@ -7,7 +7,7 @@ export type FeatureOptionsResponse = {
   contextMetadata: Record<string, unknown>;
   geminiModel: string;
   cerebrasModel: string;
-  options: Omit<BenchOption, "selected">[];
+  options: Array<Omit<BenchOption, "selected" | "applyState" | "applySummary">>;
 };
 
 export class OrchestratorClient {
@@ -43,7 +43,11 @@ export class OrchestratorClient {
     return {
       message: payload.assistantMessage,
       contextSummary: payload.contextSummary,
-      options: payload.options.map((option) => ({ ...option, selected: false }))
+      options: payload.options.map((option) => ({
+        ...option,
+        selected: false,
+        applyState: "idle"
+      }))
     };
   }
 }

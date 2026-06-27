@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { OrchestratorClient } from "./services/orchestratorClient";
-import { NoopSandboxRunner, SelectionOnlyApplyProvider } from "./services/placeholders";
+import { PreviewApplyProvider } from "./services/applyProvider";
+import { NoopSandboxRunner } from "./services/placeholders";
 import { BenchOption, ChatMessage, WorkspaceContext } from "./types";
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -31,12 +32,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private readonly orchestrator = new OrchestratorClient();
   private readonly sandboxRunner = new NoopSandboxRunner();
-  private readonly applyProvider = new SelectionOnlyApplyProvider();
+  private readonly applyProvider = new PreviewApplyProvider();
   private messages: ChatMessage[] = [
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
+      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Selecting an option now opens a preview before anything touches your files."
     }
   ];
   private options: BenchOption[] = [];
@@ -68,6 +69,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "selectOption":
           await this.selectOption(message.optionId);
+          break;
+        case "applySelected":
+          await this.applySelected();
+          break;
+        case "rejectSelected":
+          await this.rejectSelected();
           break;
       }
     });
@@ -125,18 +132,76 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    try {
+      const preview = await this.applyProvider.preview(option, getWorkspaceContext());
+      this.options = this.options.map((candidate) => ({
+        ...candidate,
+        selected: candidate.id === option.id,
+        applyState: candidate.id === option.id ? "previewed" : candidate.applyState === "applied" ? "applied" : "idle",
+        applySummary: candidate.id === option.id ? preview.summary : undefined
+      }));
+      this.selectedOptionId = option.id;
+      this.messages.push({
+        id: createId("system"),
+        role: "system",
+        content: `Preview opened for "${option.title}". Review the diff, then apply or reject from the selected card.`
+      });
+      this.postState({ notice: preview.summary });
+    } catch (error) {
+      this.messages.push({
+        id: createId("system"),
+        role: "system",
+        content: `Bench could not preview "${option.title}". ${formatError(error)}`
+      });
+      this.postState({ error: formatError(error) });
+    }
+  }
+
+  private async applySelected(): Promise<void> {
+    try {
+      const result = await this.applyProvider.applySelected();
+      if (!result) {
+        return;
+      }
+
+      this.options = this.options.map((candidate) => ({
+        ...candidate,
+        selected: candidate.id === result.optionId,
+        applyState: candidate.id === result.optionId ? "applied" : "idle",
+        applySummary: candidate.id === result.optionId ? result.summary : undefined
+      }));
+      this.selectedOptionId = result.optionId;
+      this.messages.push({
+        id: createId("system"),
+        role: "system",
+        content: result.summary
+      });
+      this.postState({ notice: result.summary });
+    } catch (error) {
+      this.postState({ error: formatError(error) });
+    }
+  }
+
+  private async rejectSelected(): Promise<void> {
+    const rejectedOptionId = this.applyProvider.getPendingOptionId();
+    const summary = await this.applyProvider.rejectSelected();
+    if (!summary || !rejectedOptionId) {
+      return;
+    }
+
     this.options = this.options.map((candidate) => ({
       ...candidate,
-      selected: candidate.id === option.id
+      selected: false,
+      applyState: candidate.id === rejectedOptionId ? "idle" : candidate.applyState === "applied" ? "applied" : "idle",
+      applySummary: candidate.id === rejectedOptionId ? undefined : candidate.applySummary
     }));
-    this.selectedOptionId = option.id;
-    await this.applyProvider.select(option);
+    this.selectedOptionId = undefined;
     this.messages.push({
       id: createId("system"),
       role: "system",
-      content: `Selected "${option.title}". No files were changed.`
+      content: summary
     });
-    this.postState({ notice: `Selected ${option.title}. Workspace unchanged.` });
+    this.postState({ notice: summary });
   }
 
   private showMetricsPanel(optionId?: string, tab: "metrics" | "code" = "metrics"): void {
@@ -161,13 +226,25 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   private postState(extra: Partial<WebviewState> = {}): void {
     this.view?.webview.postMessage({
       type: "state",
-      state: {
-        messages: this.messages,
+        state: {
+        messages: this.renderMessages(),
         options: this.options,
         selectedOptionId: this.selectedOptionId,
         loading: false,
         ...extra
       } satisfies WebviewState
+    });
+  }
+
+  private renderMessages(): ChatMessage[] {
+    return this.messages.map((message) => {
+      if (!message.options?.length) {
+        return message;
+      }
+      return {
+        ...message,
+        options: this.options
+      };
     });
   }
 
@@ -236,7 +313,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Gemini chats and scores. Cerebras writes code. Docker metrics come later.</div>
+      <div class="sub">Gemini chats and scores. Cerebras writes code. Selecting an option opens a diff before you apply it.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
@@ -313,17 +390,19 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
               <div class="title">\${escapeHtml(option.title)}</div>
               <div class="summary">\${escapeHtml(option.summary)}</div>
             </div>
-            \${option.selected ? '<span class="selectedBadge">Selected</span>' : ''}
+            \${option.applyState === 'applied' ? '<span class="selectedBadge">Applied</span>' : option.selected ? '<span class="selectedBadge">Preview Ready</span>' : ''}
           </div>
           <div class="miniMetrics">
             \${metric('Read', option.metrics.readability)}
             \${metric('Speed', option.metrics.speed)}
             \${metric('Tests', option.metrics.testConfidence)}
           </div>
+          \${option.applySummary ? '<div class="summary">' + escapeHtml(option.applySummary) + '</div>' : ''}
           <div class="actions">
             <button class="secondary" data-action="viewMetrics" type="button">View Metrics</button>
             <button class="secondary" data-action="viewCode" type="button">View Code</button>
-            <button data-action="selectOption" type="button">\${option.selected ? 'Chosen' : 'Select'}</button>
+            <button class="secondary" data-action="selectOption" type="button">\${option.selected ? 'Preview Again' : 'Preview'}</button>
+            \${option.selected ? '<button data-action="applySelected" type="button">Apply</button><button class="secondary" data-action="rejectSelected" type="button">Reject</button>' : ''}
           </div>\`;
         wrap.appendChild(card);
       }
@@ -433,7 +512,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 }
 
 type WebviewMessage = {
-  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption";
+  type: "ready" | "askFeature" | "viewMetrics" | "viewCode" | "selectOption" | "applySelected" | "rejectSelected";
   text?: string;
   optionId?: string;
 };
@@ -482,7 +561,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 88,
         testConfidence: 76
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     },
     {
       id: `${slug}-modular`,
@@ -499,7 +579,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 94,
         testConfidence: 83
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     },
     {
       id: `${slug}-fast`,
@@ -516,7 +597,8 @@ function buildFallbackSuggestions(featureRequest: string): BenchOption[] {
         maintainability: 79,
         testConfidence: 71
       },
-      selected: false
+      selected: false,
+      applyState: "idle"
     }
   ];
 }
