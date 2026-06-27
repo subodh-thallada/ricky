@@ -14,6 +14,8 @@ type PendingArtifact = {
   language?: string;
   originalContent: string;
   proposedContent: string;
+  previewStartOffset: number;
+  previewEndOffset: number;
 };
 
 type PendingSession = {
@@ -23,22 +25,29 @@ type PendingSession = {
 };
 
 const textEncoder = new TextEncoder();
+const previewDecoration = vscode.window.createTextEditorDecorationType({
+  isWholeLine: false,
+  backgroundColor: new vscode.ThemeColor("diffEditor.insertedTextBackground"),
+  overviewRulerColor: new vscode.ThemeColor("diffEditorOverview.insertedForeground"),
+  overviewRulerLane: vscode.OverviewRulerLane.Right,
+  border: "1px solid rgba(115, 201, 145, 0.35)"
+});
 
 export class PreviewApplyProvider implements ApplyProvider {
   private pending?: PendingSession;
 
   async preview(option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult> {
-    const session = await this.buildSession(option, workspaceContext);
-    this.pending = session;
-
-    for (const artifact of session.artifacts) {
-      await this.openDiffPreview(session.optionTitle, artifact);
+    if (this.pending) {
+      await this.restorePreview(this.pending);
     }
+    const session = await this.buildSession(option, workspaceContext);
+    await this.showInlinePreview(session);
+    this.pending = session;
 
     return {
       optionId: option.id,
       fileCount: session.artifacts.length,
-      summary: `Opened preview for ${session.artifacts.length} file${session.artifacts.length === 1 ? "" : "s"}.`
+      summary: `Loaded preview into ${session.artifacts[0]?.displayPath ?? "the active file"} as unsaved changes.`
     };
   }
 
@@ -49,13 +58,17 @@ export class PreviewApplyProvider implements ApplyProvider {
 
     const session = this.pending;
     for (const artifact of session.artifacts) {
-      const currentContent = await readFileIfExists(artifact.targetUri);
-      if (currentContent !== artifact.originalContent) {
-        throw new Error(`"${artifact.displayPath}" changed after preview. Re-open the preview before applying.`);
+      const document = await vscode.workspace.openTextDocument(artifact.targetUri);
+      if (document.getText() !== artifact.proposedContent) {
+        throw new Error(`"${artifact.displayPath}" changed after preview. Re-preview before applying.`);
       }
 
       await ensureParentDirectory(artifact.targetUri);
-      await vscode.workspace.fs.writeFile(artifact.targetUri, textEncoder.encode(artifact.proposedContent));
+      clearPreviewDecorations(document);
+      const saved = await document.save();
+      if (!saved) {
+        throw new Error(`Bench could not save "${artifact.displayPath}".`);
+      }
     }
 
     await this.revealFirstArtifact(session.artifacts[0]);
@@ -64,7 +77,7 @@ export class PreviewApplyProvider implements ApplyProvider {
     return {
       optionId: session.optionId,
       fileCount: session.artifacts.length,
-      summary: `Applied ${session.artifacts.length} file${session.artifacts.length === 1 ? "" : "s"} to the workspace.`
+      summary: `Applied preview to ${session.artifacts[0]?.displayPath ?? "the file"} and saved it.`
     };
   }
 
@@ -74,8 +87,9 @@ export class PreviewApplyProvider implements ApplyProvider {
     }
 
     const session = this.pending;
+    await this.restorePreview(session);
     this.pending = undefined;
-    return `Rejected preview for ${session.artifacts.length} file${session.artifacts.length === 1 ? "" : "s"}.`;
+    return `Restored ${session.artifacts[0]?.displayPath ?? "the file"} to its pre-preview contents.`;
   }
 
   getPendingOptionId(): string | undefined {
@@ -84,12 +98,17 @@ export class PreviewApplyProvider implements ApplyProvider {
 
   private async buildSession(option: BenchOption, workspaceContext: WorkspaceContext): Promise<PendingSession> {
     const explicitArtifacts = parseExplicitArtifacts(option.generatedCode);
-    const artifacts = explicitArtifacts.some((artifact) => artifact.relativePath)
-      ? await this.buildExplicitArtifacts(explicitArtifacts)
-      : await this.buildEditorArtifact(explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext);
+    const artifacts = shouldPreferActiveEditor(explicitArtifacts, workspaceContext)
+      ? await this.buildEditorArtifact(explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext)
+      : explicitArtifacts.some((artifact) => artifact.relativePath)
+        ? await this.buildExplicitArtifacts(explicitArtifacts)
+        : await this.buildEditorArtifact(explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext);
 
     if (!artifacts.length) {
       throw new Error("Bench could not determine where to preview this code.");
+    }
+    if (artifacts.length > 1) {
+      throw new Error("Bench inline preview currently supports one file at a time. Ask for a narrower change or keep one file focused.");
     }
 
     return {
@@ -117,7 +136,9 @@ export class PreviewApplyProvider implements ApplyProvider {
         displayPath: normalizeDisplayPath(artifact.relativePath),
         language: artifact.language ?? languageFromPath(artifact.relativePath),
         originalContent: await readFileIfExists(targetUri),
-        proposedContent: artifact.content
+        proposedContent: artifact.content,
+        previewStartOffset: 0,
+        previewEndOffset: artifact.content.length
       });
     }
     return pending;
@@ -149,31 +170,25 @@ export class PreviewApplyProvider implements ApplyProvider {
           : path.basename(document.uri.fsPath),
         language: document.languageId,
         originalContent,
-        proposedContent
+        proposedContent,
+        previewStartOffset: selection.isEmpty ? document.offsetAt(selection.active) : document.offsetAt(selection.start),
+        previewEndOffset: (
+          selection.isEmpty
+            ? document.offsetAt(selection.active) + trimTrailingWhitespace(code).length
+            : document.offsetAt(selection.start) + trimTrailingWhitespace(code).length
+        )
       }
     ];
   }
 
-  private async openDiffPreview(optionTitle: string, artifact: PendingArtifact): Promise<void> {
-    const leftDocument = await vscode.workspace.openTextDocument({
-      language: artifact.language,
-      content: artifact.originalContent
-    });
-    const rightDocument = await vscode.workspace.openTextDocument({
-      language: artifact.language,
-      content: artifact.proposedContent
-    });
-
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      leftDocument.uri,
-      rightDocument.uri,
-      `Bench Preview: ${artifact.displayPath} (${optionTitle})`,
-      {
-        preview: true,
-        viewColumn: vscode.ViewColumn.Beside
-      }
-    );
+  private async showInlinePreview(session: PendingSession): Promise<void> {
+    const artifact = session.artifacts[0];
+    if (!artifact) {
+      return;
+    }
+    const document = await this.openArtifactDocument(artifact);
+    await replaceDocumentContents(document, artifact.proposedContent);
+    applyPreviewDecorations(document, artifact);
   }
 
   private async revealFirstArtifact(artifact?: PendingArtifact): Promise<void> {
@@ -181,8 +196,23 @@ export class PreviewApplyProvider implements ApplyProvider {
       return;
     }
 
-    const document = await vscode.workspace.openTextDocument(artifact.targetUri);
-    await vscode.window.showTextDocument(document, { preview: false });
+    await this.openArtifactDocument(artifact);
+  }
+
+  private async restorePreview(session: PendingSession): Promise<void> {
+    const artifact = session.artifacts[0];
+    if (!artifact) {
+      return;
+    }
+    const document = await this.openArtifactDocument(artifact);
+    await replaceDocumentContents(document, artifact.originalContent);
+    clearPreviewDecorations(document);
+  }
+
+  private async openArtifactDocument(artifact: PendingArtifact): Promise<vscode.TextDocument> {
+    const document = await openOrCreateDocument(artifact);
+    await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
+    return document;
   }
 }
 
@@ -277,6 +307,47 @@ async function ensureParentDirectory(uri: vscode.Uri): Promise<void> {
   await vscode.workspace.fs.createDirectory(parentUri);
 }
 
+async function openOrCreateDocument(artifact: PendingArtifact): Promise<vscode.TextDocument> {
+  try {
+    return await vscode.workspace.openTextDocument(artifact.targetUri);
+  } catch {
+    await ensureParentDirectory(artifact.targetUri);
+    await vscode.workspace.fs.writeFile(artifact.targetUri, textEncoder.encode(artifact.originalContent));
+    return vscode.workspace.openTextDocument(artifact.targetUri);
+  }
+}
+
+async function replaceDocumentContents(document: vscode.TextDocument, content: string): Promise<void> {
+  const editor = await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
+  const fullRange = new vscode.Range(
+    document.positionAt(0),
+    document.positionAt(document.getText().length)
+  );
+  const success = await editor.edit((editBuilder) => {
+    editBuilder.replace(fullRange, content);
+  });
+  if (!success) {
+    throw new Error(`Bench could not update "${path.basename(document.uri.fsPath)}".`);
+  }
+}
+
+function applyPreviewDecorations(document: vscode.TextDocument, artifact: PendingArtifact): void {
+  const editor = vscode.window.visibleTextEditors.find((item) => item.document.uri.toString() === document.uri.toString());
+  if (!editor) {
+    return;
+  }
+
+  const safeStart = Math.max(0, Math.min(artifact.previewStartOffset, document.getText().length));
+  const safeEnd = Math.max(safeStart, Math.min(artifact.previewEndOffset, document.getText().length));
+  const range = new vscode.Range(document.positionAt(safeStart), document.positionAt(safeEnd));
+  editor.setDecorations(previewDecoration, range.isEmpty ? [] : [range]);
+}
+
+function clearPreviewDecorations(document: vscode.TextDocument): void {
+  const editor = vscode.window.visibleTextEditors.find((item) => item.document.uri.toString() === document.uri.toString());
+  editor?.setDecorations(previewDecoration, []);
+}
+
 function replaceSelection(source: string, start: number, end: number, code: string): string {
   return `${source.slice(0, start)}${trimTrailingWhitespace(code)}${source.slice(end)}`;
 }
@@ -311,4 +382,31 @@ function languageFromPath(filePath: string): string | undefined {
     ".toml": "toml"
   };
   return map[extension];
+}
+
+function shouldPreferActiveEditor(
+  artifacts: ParsedArtifact[],
+  workspaceContext: WorkspaceContext
+): boolean {
+  if (!vscode.window.activeTextEditor || !workspaceContext.activeFileName) {
+    return false;
+  }
+
+  if (artifacts.length !== 1) {
+    return false;
+  }
+
+  const artifact = artifacts[0];
+  if (!artifact.relativePath) {
+    return true;
+  }
+
+  const normalizedTarget = normalizeDisplayPath(artifact.relativePath);
+  const normalizedActive = normalizeDisplayPath(vscode.workspace.asRelativePath(workspaceContext.activeFileName, false));
+  if (normalizedTarget === normalizedActive) {
+    return true;
+  }
+
+  const genericGeneratedPrefixes = ["src/generated/", "generated/", "bench_preview/"];
+  return genericGeneratedPrefixes.some((prefix) => normalizedTarget.startsWith(prefix));
 }

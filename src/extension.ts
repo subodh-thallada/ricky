@@ -37,7 +37,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     {
       id: "welcome",
       role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Selecting an option now opens a preview before anything touches your files."
+      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Preview now loads directly into the editor as an inline draft."
     }
   ];
   private options: BenchOption[] = [];
@@ -141,18 +141,13 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         applySummary: candidate.id === option.id ? preview.summary : undefined
       }));
       this.selectedOptionId = option.id;
-      this.messages.push({
-        id: createId("system"),
-        role: "system",
-        content: `Preview opened for "${option.title}". Review the diff, then apply or reject from the selected card.`
-      });
+      void vscode.window.showInformationMessage(
+        `Preview loaded for "${option.title}". Review the inline draft in the editor, then apply or reject from the selected card.`
+      );
       this.postState({ notice: preview.summary });
     } catch (error) {
-      this.messages.push({
-        id: createId("system"),
-        role: "system",
-        content: `Bench could not preview "${option.title}". ${formatError(error)}`
-      });
+      const errorMessage = `Bench could not preview "${option.title}". ${formatError(error)}`;
+      void vscode.window.showErrorMessage(errorMessage);
       this.postState({ error: formatError(error) });
     }
   }
@@ -171,14 +166,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         applySummary: candidate.id === result.optionId ? result.summary : undefined
       }));
       this.selectedOptionId = result.optionId;
-      this.messages.push({
-        id: createId("system"),
-        role: "system",
-        content: result.summary
-      });
+      void vscode.window.showInformationMessage(result.summary);
       this.postState({ notice: result.summary });
     } catch (error) {
-      this.postState({ error: formatError(error) });
+      const errorMessage = formatError(error);
+      void vscode.window.showErrorMessage(errorMessage);
+      this.postState({ error: errorMessage });
     }
   }
 
@@ -196,11 +189,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       applySummary: candidate.id === rejectedOptionId ? undefined : candidate.applySummary
     }));
     this.selectedOptionId = undefined;
-    this.messages.push({
-      id: createId("system"),
-      role: "system",
-      content: summary
-    });
+    void vscode.window.showInformationMessage(summary);
     this.postState({ notice: summary });
   }
 
@@ -313,7 +302,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   <div class="app">
     <header>
       <div class="brand"><span class="bolt">B</span><span>Bench</span></div>
-      <div class="sub">Gemini chats and scores. Cerebras writes code. Selecting an option opens a diff before you apply it.</div>
+      <div class="sub">Gemini chats and scores. Cerebras writes code. Preview loads directly into the editor before you apply it.</div>
     </header>
     <main id="messages"></main>
     <form class="composer" id="form">
