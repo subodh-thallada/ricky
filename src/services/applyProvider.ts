@@ -168,7 +168,7 @@ export class PreviewApplyProvider implements ApplyProvider {
         targetUri,
         displayPath: normalizeDisplayPath(artifact.relativePath),
         language: artifact.language ?? languageFromPath(artifact.relativePath),
-        originalContent: await readFileIfExists(targetUri),
+        originalContent: await this.readBaseContent(targetUri),
         proposedContent: artifact.content,
         previewStartOffset: 0,
         previewEndOffset: artifact.content.length
@@ -188,8 +188,18 @@ export class PreviewApplyProvider implements ApplyProvider {
     }
 
     const { document, displayPath, selection } = target;
-    const originalContent = document.getText();
-    const placement = inferPlacementRange(document, code, selection);
+    const originalContent = this.getBaseContentForDocument(document);
+    const placement = inferPlacementRange(
+      originalContent,
+      document.languageId,
+      selection && !selection.isEmpty
+        ? {
+            startOffset: document.offsetAt(selection.start),
+            endOffset: document.offsetAt(selection.end)
+          }
+        : undefined,
+      code
+    );
     const proposedContent = replaceSelection(
       originalContent,
       placement.startOffset,
@@ -208,6 +218,32 @@ export class PreviewApplyProvider implements ApplyProvider {
         previewEndOffset: placement.startOffset + trimTrailingWhitespace(code).length
       }
     ];
+  }
+
+  private getBaseContentForDocument(document: vscode.TextDocument): string {
+    const existingOwner = this.fileOwners.get(document.uri.toString());
+    if (!existingOwner) {
+      return document.getText();
+    }
+
+    const existingSession = this.pendingSessions.get(existingOwner);
+    const existingArtifact = existingSession?.artifacts.find(
+      (artifact) => artifact.targetUri.toString() === document.uri.toString()
+    );
+    return existingArtifact?.originalContent ?? document.getText();
+  }
+
+  private async readBaseContent(targetUri: vscode.Uri): Promise<string> {
+    const existingOwner = this.fileOwners.get(targetUri.toString());
+    if (!existingOwner) {
+      return readFileIfExists(targetUri);
+    }
+
+    const existingSession = this.pendingSessions.get(existingOwner);
+    const existingArtifact = existingSession?.artifacts.find(
+      (artifact) => artifact.targetUri.toString() === targetUri.toString()
+    );
+    return existingArtifact?.originalContent ?? readFileIfExists(targetUri);
   }
 
   private async showInlinePreview(session: PendingSession): Promise<void> {
@@ -540,31 +576,31 @@ function scoreTargetDocument(
 }
 
 function inferPlacementRange(
-  document: vscode.TextDocument,
-  code: string,
-  selection?: vscode.Selection
+  text: string,
+  languageId: string,
+  selection?: { startOffset: number; endOffset: number },
+  code?: string
 ): PlacementRange {
-  const text = document.getText();
-  if (selection && !selection.isEmpty) {
+  if (selection) {
     return {
-      startOffset: document.offsetAt(selection.start),
-      endOffset: document.offsetAt(selection.end)
+      startOffset: selection.startOffset,
+      endOffset: selection.endOffset
     };
   }
 
-  for (const symbol of extractDeclaredSymbols(code)) {
-    const range = findTopLevelSymbolRange(text, document.languageId, symbol);
+  for (const symbol of extractDeclaredSymbols(code ?? "")) {
+    const range = findTopLevelSymbolRange(text, languageId, symbol);
     if (range) {
       return range;
     }
   }
 
-  const placeholderRange = findPlaceholderRange(text, document.languageId);
+  const placeholderRange = findPlaceholderRange(text, languageId);
   if (placeholderRange) {
     return placeholderRange;
   }
 
-  const appendOffset = inferAppendOffset(text, document.languageId);
+  const appendOffset = inferAppendOffset(text, languageId);
   return {
     startOffset: appendOffset,
     endOffset: appendOffset
