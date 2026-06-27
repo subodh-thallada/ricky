@@ -1,0 +1,19 @@
+{
+  "id": "mock-shop-checkout",
+  "label": "Mock shop · checkout (stock rollback on payment failure)",
+  "language": "python",
+  "target_file": "mock_shop/checkout.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-mock-shop-checkout:local",
+  "timeout_ms": 15000,
+  "candidates_dir": "candidates",
+  "routing": {
+    "module": "checkout",
+    "basename": "checkout.py",
+    "required_defs": ["\\bdef\\s+checkout\\s*\\(", "\\bdef\\s+cart_total_cents\\s*\\("],
+    "reference_candidates": ["try_except_rollback", "reserve_after_charge"],
+    "prompt_hint": "rewrite mock_shop/checkout.py so checkout rolls back reserved stock when payment fails"
+  }
+}

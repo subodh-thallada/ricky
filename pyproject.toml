@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Bench hackathon workspace with VS Code extension backend and candidate evaluation daemon"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.69.0",
     "backboard-sdk>=0.1.0",
     "cerebras_cloud_sdk>=1.0.0",
     "fastapi>=0.115.0",

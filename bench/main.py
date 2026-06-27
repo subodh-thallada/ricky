@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 
+from bench.clients.anthropic import AnthropicClient
 from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
 from bench.config import get_settings
@@ -41,8 +42,11 @@ async def providers_check() -> dict[str, object]:
     settings = get_settings()
     cerebras = CerebrasClient(settings)
     backboard = BackboardAdapter(settings)
+    anthropic = AnthropicClient(settings)
     return {
-        "primary_provider": "cerebras",
+        "primary_provider": settings.primary_llm_provider,
+        "chat_provider": settings.chat_provider,
+        "anthropic": await anthropic.check(),
         "cerebras": await cerebras.check(),
         "backboard": await backboard.check(),
     }
@@ -51,7 +55,11 @@ async def providers_check() -> dict[str, object]:
 @app.post("/feature-options", response_model=FeatureOptionsResponse)
 async def feature_options(request: FeatureOptionsRequest) -> FeatureOptionsResponse:
     settings = get_settings()
-    service = FeatureOptionsService(CerebrasClient(settings), BackboardAdapter(settings))
+    service = FeatureOptionsService(
+        CerebrasClient(settings),
+        AnthropicClient(settings),
+        BackboardAdapter(settings),
+    )
     return await service.generate(request)
 
 

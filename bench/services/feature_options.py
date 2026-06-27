@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+from bench.clients.anthropic import AnthropicClient
 from bench.clients.backboard import BackboardAdapter
 from bench.clients.cerebras import CerebrasClient
 from bench.schemas import (
@@ -17,8 +18,16 @@ from bench.services.repo_context import build_repo_context
 
 
 class FeatureOptionsService:
-    def __init__(self, cerebras: CerebrasClient, memory: BackboardAdapter | None = None):
+    def __init__(
+        self,
+        cerebras: CerebrasClient,
+        anthropic: AnthropicClient | None = None,
+        memory: BackboardAdapter | None = None,
+    ):
         self.cerebras = cerebras
+        # Cerebras writes the heavy code; Haiku reshapes it into strict option JSON
+        # when Cerebras returns non-structured output (prose / raw code blocks).
+        self.anthropic = anthropic
         self.memory = memory
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
@@ -139,7 +148,9 @@ class FeatureOptionsService:
                 {"role": "system", "content": _build_system_prompt()},
                 {"role": "user", "content": json.dumps(user_payload)},
             ],
-            max_completion_tokens=2200,
+            # zai-glm-4.7 is a reasoning model (~1.7k tokens go to reasoning); budget
+            # must leave room for the full JSON body or it truncates and fails to parse.
+            max_completion_tokens=6000,
             temperature=0.35,
             response_format={"type": "json_object"},
             disable_reasoning=True,
@@ -162,7 +173,69 @@ class FeatureOptionsService:
             response_format={"type": "json_object"},
             disable_reasoning=True,
         )
-        return retry_response, _parse_options(retry_response.text or "")
+        retry_suggestions = _parse_options(retry_response.text or "")
+        if not _is_raw_fallback(retry_suggestions):
+            return retry_response, retry_suggestions
+
+        # Cerebras still under-delivered (single raw draft / empty code). Let Haiku reshape
+        # its richest raw output into strict option JSON, preserving the code verbatim.
+        cerebras_best, cerebras_response = max(
+            ((suggestions, response), (retry_suggestions, retry_response)),
+            key=lambda pair: _code_coverage(pair[0]),
+        )
+        if self.anthropic is not None:
+            # Feed Haiku the richest raw output (longest text wins, even if both attempts
+            # truncated) so it can complete/reshape it into valid option JSON.
+            raw_text = max(
+                (retry_response.text or ""), (response.text or ""), key=len
+            ).strip()
+            structured = await self._structure_with_anthropic(raw_text)
+            # Prefer Haiku's clean structuring on ties — a real option beats a raw "draft".
+            if structured and _code_coverage(structured) >= _code_coverage(cerebras_best):
+                # Code is still Cerebras's; Haiku only reshaped it, so keep cerebras_response
+                # for the cerebras_model label.
+                return cerebras_response, structured
+        return cerebras_response, cerebras_best
+
+    async def _structure_with_anthropic(self, raw_text: str) -> list[FeatureOption]:
+        if self.anthropic is None or not raw_text.strip():
+            return []
+        try:
+            result = await self.anthropic.chat(
+                [
+                    {"role": "system", "content": _build_restructure_prompt()},
+                    {"role": "user", "content": raw_text},
+                ],
+                max_completion_tokens=4096,
+                temperature=0.1,
+            )
+        except Exception:
+            return []
+        return _parse_options(result.text or "")
+
+
+def _code_coverage(options: list[FeatureOption]) -> int:
+    """Count options that carry non-empty generatedCode."""
+    return sum(
+        1
+        for option in options
+        if (option.model_dump(by_alias=True).get("generatedCode") or "").strip()
+    )
+
+
+def _build_restructure_prompt() -> str:
+    return (
+        "You are a JSON formatter for Bench. You receive a coding assistant's raw draft "
+        "(prose and/or fenced code) that proposes one or more implementation options.\n"
+        "Reshape it into Bench option JSON. Preserve every code block verbatim inside "
+        "generatedCode; do not rewrite, summarize, or omit code. Split into separate options "
+        "only where the draft clearly presents distinct approaches; otherwise return one option.\n"
+        "If the draft uses '### relative/path.ext' file headers, keep them inside generatedCode.\n"
+        "Each option needs: id, title, summary, implementationPlan, tradeoffs (array of strings), generatedCode.\n"
+        "Return only valid JSON. No Markdown, no commentary outside JSON.\n"
+        'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
+        '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
+    )
 
 
 def _parse_options(content: str) -> list[FeatureOption]:

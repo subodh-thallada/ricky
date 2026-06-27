@@ -1,0 +1,19 @@
+{
+  "id": "mock-shop-db",
+  "label": "Mock shop · db (case-insensitive email lookup)",
+  "language": "python",
+  "target_file": "mock_shop/db.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-mock-shop-db:local",
+  "timeout_ms": 15000,
+  "candidates_dir": "candidates",
+  "routing": {
+    "module": "db",
+    "basename": "db.py",
+    "required_defs": ["\\bdef\\s+get_user_by_email\\s*\\(", "\\bdef\\s+get_product\\s*\\("],
+    "reference_candidates": ["lower_normalize", "casefold_normalize"],
+    "prompt_hint": "rewrite mock_shop/db.py so get_user_by_email is case-insensitive"
+  }
+}

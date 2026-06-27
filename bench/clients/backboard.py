@@ -5,6 +5,7 @@ from typing import Any
 
 from backboard import BackboardClient
 
+from bench.clients.types import TextGenerationResult
 from bench.config import Settings
 
 
@@ -71,6 +72,33 @@ class BackboardAdapter:
             elif item:
                 output.append(str(item))
         return output
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_completion_tokens: int = 512,
+        temperature: float = 0.2,
+    ) -> TextGenerationResult:
+        system_chunks = [m["content"] for m in messages if m["role"] == "system"]
+        non_system = [m for m in messages if m["role"] != "system"]
+        prompt_parts = [f"{m['role'].upper()}:\n{m['content']}" for m in non_system]
+        system_prompt = "\n\n".join(system_chunks) if system_chunks else None
+
+        client = self._client()
+        response = await client.send_message(
+            "\n\n".join(prompt_parts),
+            system_prompt=system_prompt,
+            llm_provider=self.settings.backboard_llm_provider,
+            model_name=self.settings.backboard_model_name,
+            stream=False,
+        )
+        return TextGenerationResult(
+            model=self.settings.backboard_model_name,
+            text=getattr(response, "content", None),
+            usage=getattr(response, "usage", None),
+            raw=response,
+        )
 
     async def check(self) -> dict[str, Any]:
         result = {"configured": bool(self.settings.backboard_api_key)}

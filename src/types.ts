@@ -56,7 +56,20 @@ export type BenchRunState = {
   summary?: string | null;
 };
 
-export type BenchFixtureId = "python-merge" | "fastapi-auth-endpoint";
+// mock-shop is no longer a single fixture: every module in the mock_shop package
+// (auth, checkout, payments, db, models) is its own Docker fixture targeting one
+// file, so a candidate is tested against the module it actually rewrites instead of
+// being force-routed to auth. Keep this union in sync with fixtures/mock-shop-*/
+// (the generated registry in src/fixtures/mockShopReference.generated.ts is the
+// data source; this union gives the compiler the closed set).
+export type BenchFixtureId =
+  | "python-merge"
+  | "fastapi-auth-endpoint"
+  | "mock-shop-auth"
+  | "mock-shop-checkout"
+  | "mock-shop-payments"
+  | "mock-shop-db"
+  | "mock-shop-models";
 
 export type ChatMessage = {
   id: string;

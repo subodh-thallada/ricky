@@ -8,6 +8,9 @@ class Settings(BaseSettings):
 
     app_name: str = "Bench Orchestrator"
     primary_llm_provider: str = "cerebras"
+    chat_provider: str = "anthropic"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-haiku-4-5-20251001"
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_model: str = "gemini-2.5-flash"

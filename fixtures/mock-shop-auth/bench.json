@@ -1,0 +1,19 @@
+{
+  "id": "mock-shop-auth",
+  "label": "Mock shop · auth (login rate limiting + lockout)",
+  "language": "python",
+  "target_file": "mock_shop/auth.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-mock-shop-auth:local",
+  "timeout_ms": 15000,
+  "candidates_dir": "candidates",
+  "routing": {
+    "module": "auth",
+    "basename": "auth.py",
+    "required_defs": ["\\bdef\\s+login\\s*\\(", "\\bdef\\s+signup\\s*\\("],
+    "reference_candidates": ["sliding_window", "token_bucket"],
+    "prompt_hint": "rewrite mock_shop/auth.py to add login rate limiting and account lockout"
+  }
+}

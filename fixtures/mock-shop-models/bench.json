@@ -1,0 +1,19 @@
+{
+  "id": "mock-shop-models",
+  "label": "Mock shop · models (domain field validation)",
+  "language": "python",
+  "target_file": "mock_shop/models.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-mock-shop-models:local",
+  "timeout_ms": 15000,
+  "candidates_dir": "candidates",
+  "routing": {
+    "module": "models",
+    "basename": "models.py",
+    "required_defs": ["\\bclass\\s+Product\\b", "\\bclass\\s+CartItem\\b"],
+    "reference_candidates": ["post_init_validate", "guarded_validate"],
+    "prompt_hint": "rewrite mock_shop/models.py to validate domain fields in __post_init__"
+  }
+}

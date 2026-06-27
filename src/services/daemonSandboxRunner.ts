@@ -1,6 +1,7 @@
 import { BenchFixtureId, BenchOption, CandidateMeasurement, CandidateRunStatus } from "../types";
 import { CandidateSpec, DaemonClient, DaemonEvent, DecisionPayload, RunCreateRequest } from "./daemonClient";
 import { ensureLocalService } from "./localServiceManager";
+import { MOCK_SHOP_MODULES, MockShopModule } from "../fixtures/mockShopReference.generated";
 
 export type CandidateUpdate = {
   optionId: string;
@@ -18,6 +19,37 @@ export type RunCallbacks = {
   onDecision(payload: DecisionPayload, updates: CandidateUpdate[]): void;
 };
 
+// Where each fixture expects the candidate code to land inside its workspace. Each
+// mock-shop module fixture targets one file in the mock_shop package; the others
+// take a single flat candidate file.
+const FIXTURE_TARGET_FILE: Record<BenchFixtureId, string> = {
+  "python-merge": "candidate_target.py",
+  "fastapi-auth-endpoint": "candidate_target.py",
+  "mock-shop-auth": "mock_shop/auth.py",
+  "mock-shop-checkout": "mock_shop/checkout.py",
+  "mock-shop-payments": "mock_shop/payments.py",
+  "mock-shop-db": "mock_shop/db.py",
+  "mock-shop-models": "mock_shop/models.py"
+};
+
+// Registry-driven lookup for the mock-shop module fixtures (auth/checkout/payments/
+// db/models). One fixture per module; detection + routing key off this generated
+// registry instead of hardcoding the auth module, so a checkout candidate runs
+// against the checkout fixture rather than being force-swapped to auth.
+const MOCK_SHOP_BY_FIXTURE: Map<BenchFixtureId, MockShopModule> = new Map(
+  MOCK_SHOP_MODULES.map((mod) => [mod.fixtureId as BenchFixtureId, mod])
+);
+
+export const MOCK_SHOP_FIXTURES: MockShopModule[] = MOCK_SHOP_MODULES;
+
+export function isMockShopFixture(fixtureId: BenchFixtureId): boolean {
+  return MOCK_SHOP_BY_FIXTURE.has(fixtureId);
+}
+
+export function mockShopModuleForFixture(fixtureId: BenchFixtureId): MockShopModule | undefined {
+  return MOCK_SHOP_BY_FIXTURE.get(fixtureId);
+}
+
 export class DaemonSandboxRunner {
   constructor(private readonly client = new DaemonClient()) {}
 
@@ -27,6 +59,14 @@ export class DaemonSandboxRunner {
 
   validateFastApiAuthOptions(options: BenchOption[]): BenchOption[] {
     return options.filter((option) => isFastApiAuthImplementation(option.generatedCode));
+  }
+
+  validateMockShopOptions(options: BenchOption[], fixtureId: BenchFixtureId): BenchOption[] {
+    const mod = MOCK_SHOP_BY_FIXTURE.get(fixtureId);
+    if (!mod) {
+      return [];
+    }
+    return options.filter((option) => matchesMockShopModule(option.generatedCode, mod));
   }
 
   async runPythonMerge(options: BenchOption[], callbacks: RunCallbacks, signal?: AbortSignal): Promise<DecisionPayload> {
@@ -44,6 +84,23 @@ export class DaemonSandboxRunner {
       "fastapi-auth-endpoint",
       this.validateFastApiAuthOptions(options),
       "Need at least two Python FastAPI options defining create_app() before running the fastapi-auth-endpoint fixture.",
+      callbacks,
+      signal
+    );
+  }
+
+  async runMockShop(
+    fixtureId: BenchFixtureId,
+    options: BenchOption[],
+    callbacks: RunCallbacks,
+    signal?: AbortSignal
+  ): Promise<DecisionPayload> {
+    const mod = MOCK_SHOP_BY_FIXTURE.get(fixtureId);
+    const target = mod?.targetFile ?? FIXTURE_TARGET_FILE[fixtureId];
+    return this.runFixture(
+      fixtureId,
+      this.validateMockShopOptions(options, fixtureId),
+      `Need at least two Python options that rewrite ${target} before running the ${mod?.label ?? fixtureId} fixture.`,
       callbacks,
       signal
     );
@@ -74,7 +131,7 @@ export class DaemonSandboxRunner {
       throw new Error("Bench daemon is running, but Docker is not available to the daemon process.");
     }
 
-    const mapped = mapOptionsToCandidates(validOptions);
+    const mapped = mapOptionsToCandidates(validOptions, fixtureId);
     const request: RunCreateRequest = {
       fixture_id: fixtureId,
       rebuild_image: false,
@@ -120,11 +177,12 @@ export class DaemonSandboxRunner {
   }
 }
 
-function mapOptionsToCandidates(options: BenchOption[]): {
+function mapOptionsToCandidates(options: BenchOption[], fixtureId: BenchFixtureId): {
   candidates: CandidateSpec[];
   optionCandidatePairs: Array<{ optionId: string; candidateId: string }>;
   candidateToOptionId: Map<string, string>;
 } {
+  const targetFile = FIXTURE_TARGET_FILE[fixtureId];
   const usedIds = new Set<string>();
   const optionCandidatePairs: Array<{ optionId: string; candidateId: string }> = [];
   const candidateToOptionId = new Map<string, string>();
@@ -136,13 +194,79 @@ function mapOptionsToCandidates(options: BenchOption[]): {
       candidate_id: candidateId,
       label: option.title || `Candidate ${index + 1}`,
       rationale: buildRationale(option),
-      files: {
-        "candidate_target.py": option.generatedCode
-      }
+      files: buildCandidateFiles(fixtureId, targetFile, option.generatedCode)
     };
   });
 
   return { candidates, optionCandidatePairs, candidateToOptionId };
+}
+
+// Mock-shop modules live inside the mock_shop package; map any generated section
+// onto that package by basename so the candidate overlays the real workspace.
+const MOCK_SHOP_PACKAGE = "mock_shop";
+
+// Turn an option's generatedCode into the file map the daemon overlays onto the
+// fixture workspace. Most fixtures take a single target file verbatim; mock-shop
+// parses "### path" + fenced sections so a candidate can rewrite mock_shop/auth.py
+// (and optionally add sibling modules like mock_shop/rate_limit.py).
+function buildCandidateFiles(
+  fixtureId: BenchFixtureId,
+  targetFile: string,
+  generatedCode: string
+): Record<string, string> {
+  if (!MOCK_SHOP_BY_FIXTURE.has(fixtureId)) {
+    return { [targetFile]: generatedCode };
+  }
+
+  const files: Record<string, string> = {};
+  const sections = parseFileSections(generatedCode);
+  for (const section of sections) {
+    const base = section.path.split("/").pop() ?? "";
+    if (!base.endsWith(".py")) {
+      continue;
+    }
+    files[`${MOCK_SHOP_PACKAGE}/${base}`] = section.code;
+  }
+
+  if (!files[targetFile]) {
+    // No auth.py section was captured — treat the whole snippet (joined sections
+    // or the raw, fence-stripped body) as the auth module.
+    const flat = sections.length
+      ? sections.map((section) => section.code).join("\n\n")
+      : stripCodeFences(generatedCode);
+    files[targetFile] = flat.trim() ? flat : generatedCode;
+  }
+  return files;
+}
+
+type FileSection = { path: string; code: string };
+
+function parseFileSections(text: string): FileSection[] {
+  const sections: FileSection[] = [];
+  // "### relative/path.ext" followed by a fenced code block.
+  const headed = /(?:^|\n)###\s*([^\n`]+?)\s*\n+```[\w-]*\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+  while ((match = headed.exec(text)) !== null) {
+    sections.push({ path: match[1].trim(), code: normalizeCode(match[2]) });
+  }
+  if (sections.length) {
+    return sections;
+  }
+  // No path headers: collect bare fenced blocks (path unknown).
+  const bare = /```[\w-]*\n([\s\S]*?)```/g;
+  while ((match = bare.exec(text)) !== null) {
+    sections.push({ path: "", code: normalizeCode(match[1]) });
+  }
+  return sections;
+}
+
+function stripCodeFences(text: string): string {
+  const fenced = /^```[\w-]*\n([\s\S]*?)```\s*$/m.exec(text.trim());
+  return fenced ? normalizeCode(fenced[1]) : text;
+}
+
+function normalizeCode(code: string): string {
+  return `${code.replace(/\s+$/, "")}\n`;
 }
 
 function uniqueCandidateId(optionId: string, index: number, usedIds: Set<string>): string {
@@ -172,6 +296,16 @@ function isFastApiAuthImplementation(code: string): boolean {
     /\bFastAPI\b/.test(code) &&
     /\/protected/.test(code)
   );
+}
+
+// A mock-shop candidate matches a module fixture when, after extracting files, the
+// module's target file defines that module's required public surface (auth -> login
+// + signup, checkout -> checkout + cart_total_cents, etc.). Detection is data-driven
+// from the generated registry, so adding a module fixture needs no change here.
+function matchesMockShopModule(code: string, mod: MockShopModule): boolean {
+  const target =
+    buildCandidateFiles(mod.fixtureId as BenchFixtureId, mod.targetFile, code)[mod.targetFile] ?? "";
+  return mod.requiredDefs.every((source) => new RegExp(source).test(target));
 }
 
 function eventToCandidateUpdate(event: DaemonEvent, candidateToOptionId: Map<string, string>, runId: string): CandidateUpdate | undefined {

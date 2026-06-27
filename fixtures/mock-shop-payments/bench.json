@@ -1,0 +1,19 @@
+{
+  "id": "mock-shop-payments",
+  "label": "Mock shop · payments (idempotent charges)",
+  "language": "python",
+  "target_file": "mock_shop/payments.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-mock-shop-payments:local",
+  "timeout_ms": 15000,
+  "candidates_dir": "candidates",
+  "routing": {
+    "module": "payments",
+    "basename": "payments.py",
+    "required_defs": ["\\bdef\\s+charge_card\\s*\\(", "\\bdef\\s+refund\\s*\\("],
+    "reference_candidates": ["key_registry", "key_in_charge_id"],
+    "prompt_hint": "rewrite mock_shop/payments.py so charge_card supports idempotency keys"
+  }
+}

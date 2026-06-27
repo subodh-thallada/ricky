@@ -2,31 +2,25 @@ def validate_student_payload(payload: dict[str, object]) -> dict[str, object]:
     """Bench demo: several valid validation styles exist for the same payload."""
 from fastapi import FastAPI, Header, HTTPException, status
 
+from fastapi import Depends, FastAPI, Header, HTTPException
+
+
+def require_token(authorization: str | None = Header(default=None)) -> None:
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    if authorization != "Bearer test-token":
+        raise HTTPException(status_code=403, detail="Invalid bearer token")
+
+
 def create_app() -> FastAPI:
     app = FastAPI()
-    
+
     @app.get("/health")
     def health():
         return {"status": "ok"}
-    
-    @app.get("/protected")
-    def protected(authorization: str = Header(None)):
-        if authorization is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing authorization header"
-            )
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization header format"
-            )
-        token = authorization.split(" ")[1]
-        if token != "test-token":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid token"
-            )
-        return {"message": "Access granted", "token": token}
-    
+
+    @app.get("/protected", dependencies=[Depends(require_token)])
+    def protected():
+        return {"authenticated": True, "strategy": "dependency"}
+
     return app

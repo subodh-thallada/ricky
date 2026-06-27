@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
-import { CandidateUpdate, DaemonSandboxRunner, RunCallbacks } from "./services/daemonSandboxRunner";
+import {
+  CandidateUpdate,
+  DaemonSandboxRunner,
+  RunCallbacks,
+  MOCK_SHOP_FIXTURES,
+  isMockShopFixture,
+  mockShopModuleForFixture
+} from "./services/daemonSandboxRunner";
 import { DecisionPayload } from "./services/daemonClient";
 import { OrchestratorClient } from "./services/orchestratorClient";
 import { PreviewApplyProvider } from "./services/applyProvider";
@@ -146,13 +153,15 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       });
       this.postState();
     } catch (error) {
-      this.options = buildFastApiAuthFallbackSuggestions(prompt);
       const messageId = createId("assistant");
       this.activeOptionsMessageId = messageId;
+      const fixtureId = inferMockShopFixtureId(prompt);
+      const mod = mockShopModuleForFixture(fixtureId);
+      this.options = buildMockShopFallbackSuggestions(fixtureId, prompt);
       this.messages.push({
         id: messageId,
         role: "assistant",
-        content: `I could not reach the Bench orchestrator, so I loaded local authenticated endpoint demo options that can still run through Docker. ${formatError(error)}`,
+        content: `I could not reach the Bench orchestrator, so I loaded local ${mod?.targetFile ?? "mock_shop/auth.py"} candidates that can still run through Docker against the mock-shop package. ${formatError(error)}`,
         options: this.options
       });
       this.postState({ error: formatError(error) });
@@ -166,23 +175,31 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 
     let fixtureId = this.pickFixtureId(this.options);
     if (this.options.length < 2 || !fixtureId) {
-      this.options = buildFastApiAuthFallbackSuggestions(this.lastPrompt || "authenticated endpoint");
-      fixtureId = "fastapi-auth-endpoint";
+      // Nothing routable: fall back to the module the PROMPT is about (checkout
+      // prompt -> checkout fixture), not always auth, so the reference candidates
+      // match what the user asked for.
+      fixtureId = inferMockShopFixtureId(this.lastPrompt);
+      const mod = mockShopModuleForFixture(fixtureId);
+      this.options = buildMockShopFallbackSuggestions(fixtureId, this.lastPrompt || mod?.promptHint || "auth lockout");
       this.messages.push({
         id: createId("system"),
         role: "system",
-        content: "Loaded local FastAPI authenticated endpoint demo options so Docker evaluation has runnable candidates."
+        content: `The generated options weren't in a runnable shape, so Bench loaded reference ${mod?.targetFile ?? "mock_shop/auth.py"} candidates (two correct designs plus a deliberately flawed control) to evaluate against the real mock-shop package in Docker.`
       });
     }
 
     const runnableOptions = this.validateOptionsForFixture(fixtureId, this.options);
     if (runnableOptions.length < 2) {
-      this.options = buildFastApiAuthFallbackSuggestions(this.lastPrompt || "authenticated endpoint");
-      fixtureId = "fastapi-auth-endpoint";
+      // Keep the detected module but swap in its reference candidates — stay on the
+      // SAME module the user asked about instead of bait-and-switching to auth.
+      const targetFixture = isMockShopFixture(fixtureId) ? fixtureId : inferMockShopFixtureId(this.lastPrompt);
+      const mod = mockShopModuleForFixture(targetFixture);
+      fixtureId = targetFixture;
+      this.options = buildMockShopFallbackSuggestions(targetFixture, this.lastPrompt || mod?.promptHint || "auth lockout");
       this.messages.push({
         id: createId("system"),
         role: "system",
-        content: "The generated cards were not compatible with a runnable endpoint fixture, so Bench swapped in FastAPI authenticated endpoint demo candidates."
+        content: `The generated cards weren't compatible with the ${mod?.label ?? targetFixture} fixture, so Bench swapped in reference ${mod?.targetFile ?? "mock_shop/auth.py"} candidates that run against the real package tests.`
       });
     }
 
@@ -422,6 +439,17 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private pickFixtureId(options: BenchOption[]): BenchFixtureId | undefined {
+    // Prefer a mock-shop module fixture whose target file the candidates actually
+    // rewrite: a checkout candidate routes to checkout, an auth candidate to auth,
+    // etc. Each runs against the real mock_shop package + that module's behavior
+    // tests, not a toy snippet. requiredDefs are disjoint per module, so at most one
+    // module gets the >=2 votes.
+    for (const mod of MOCK_SHOP_FIXTURES) {
+      const fixtureId = mod.fixtureId as BenchFixtureId;
+      if (this.sandboxRunner.validateMockShopOptions(options, fixtureId).length >= 2) {
+        return fixtureId;
+      }
+    }
     if (this.sandboxRunner.validateFastApiAuthOptions(options).length >= 2) {
       return "fastapi-auth-endpoint";
     }
@@ -432,9 +460,15 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private validateOptionsForFixture(fixtureId: BenchFixtureId, options: BenchOption[]): BenchOption[] {
-    return fixtureId === "fastapi-auth-endpoint"
-      ? this.sandboxRunner.validateFastApiAuthOptions(options)
-      : this.sandboxRunner.validatePythonMergeOptions(options);
+    if (isMockShopFixture(fixtureId)) {
+      return this.sandboxRunner.validateMockShopOptions(options, fixtureId);
+    }
+    switch (fixtureId) {
+      case "fastapi-auth-endpoint":
+        return this.sandboxRunner.validateFastApiAuthOptions(options);
+      default:
+        return this.sandboxRunner.validatePythonMergeOptions(options);
+    }
   }
 
   private async runFixture(
@@ -443,9 +477,15 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     callbacks: RunCallbacks,
     signal?: AbortSignal
   ): Promise<DecisionPayload> {
-    return fixtureId === "fastapi-auth-endpoint"
-      ? this.sandboxRunner.runFastApiAuthEndpoint(options, callbacks, signal)
-      : this.sandboxRunner.runPythonMerge(options, callbacks, signal);
+    if (isMockShopFixture(fixtureId)) {
+      return this.sandboxRunner.runMockShop(fixtureId, options, callbacks, signal);
+    }
+    switch (fixtureId) {
+      case "fastapi-auth-endpoint":
+        return this.sandboxRunner.runFastApiAuthEndpoint(options, callbacks, signal);
+      default:
+        return this.sandboxRunner.runPythonMerge(options, callbacks, signal);
+    }
   }
 
   private async fetchCandidateLogs(messageId?: string, optionId?: string, openInEditor?: boolean): Promise<void> {
@@ -799,6 +839,14 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   .passed .status-pill { color: var(--pass); }
   .failed .status-pill, .error .status-pill, .timeout .status-pill { color: var(--fail); }
   .running .status-pill, .queued .status-pill { color: var(--run); }
+  .super-pill {
+    font-family: var(--mono); font-size: 10px; font-weight: 600; line-height: 14px;
+    letter-spacing: 0.05em; text-transform: uppercase; white-space: nowrap;
+    border-radius: 999px; padding: 1px 7px;
+  }
+  .super-pill.fast { color: var(--pass); background: rgba(99, 212, 113, 0.10); border: 1px solid rgba(99, 212, 113, 0.30); }
+  .super-pill.simple { color: var(--warn); background: rgba(255, 182, 140, 0.10); border: 1px solid rgba(255, 182, 140, 0.30); }
+  .super-pill.light { color: var(--primary); background: rgba(122, 162, 255, 0.10); border: 1px solid rgba(122, 162, 255, 0.30); }
   .card-title {
     color: var(--text);
     font-size: 14px;
@@ -1501,7 +1549,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderRunBar() {
-      const hasOptions = (state.options || []).length >= 2;
+      // Show the run bar whenever there's at least one option. testAll() falls back
+      // to the mock-shop reference candidates when fewer than two are runnable, so a
+      // single "Cerebras draft" roll never strands the user without a Test all button.
+      const hasOptions = (state.options || []).length >= 1;
       const isRunning = (state.runState && state.runState.status === 'running') || (state.options || []).some(o => o.runStatus === 'queued' || o.runStatus === 'running');
       const canApply = Boolean(state.runState && state.runState.winnerCandidateId);
 
@@ -1523,9 +1574,56 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       \`;
     }
 
+    function computeSuperlatives(options) {
+      // Award each axis to the single clear winner across the option set. Ties → no award,
+      // so we never show two "Fastest" pills. Real measured metrics beat mock estimates.
+      const pills = {};
+      const toNum = (v) => { const n = typeof v === 'number' ? v : parseFloat(v); return isFinite(n) ? n : null; };
+      const codeLen = (o) => { const c = o && (o.generatedCode || o.generated_code); return (typeof c === 'string' && c.length) ? c.length : null; };
+      const measured = (o, key) => (o && isRecord(o.measured)) ? toNum(o.measured[key]) : null;
+      const mock = (o, key) => (o && isRecord(o.metrics)) ? toNum(o.metrics[key]) : null;
+      const add = (o, cls, label) => {
+        if (!o) return;
+        const id = String(o.id || '');
+        (pills[id] = pills[id] || []).push([cls, label]);
+      };
+      const pickUniqueBest = (list, valueOf, dir) => {
+        let best = null, bestVal = null, tie = false;
+        list.forEach((o) => {
+          const v = valueOf(o);
+          if (v === null) return;
+          if (bestVal === null || (dir === 'min' ? v < bestVal : v > bestVal)) { bestVal = v; best = o; tie = false; }
+          else if (v === bestVal) { tie = true; }
+        });
+        return (best && !tie) ? best : null;
+      };
+
+      const list = (options || []).filter(Boolean);
+      const passing = list.filter((o) => String(o.runStatus) === 'passed');
+      const speedPool = passing.length ? passing : list;
+
+      // Fastest: lowest real runtime among passing; else highest mock speed score.
+      let fastest = pickUniqueBest(speedPool, (o) => measured(o, 'durationMs'), 'min');
+      if (!fastest) fastest = pickUniqueBest(list, (o) => mock(o, 'speed'), 'max');
+      add(fastest, 'fast', 'Fastest');
+
+      // Simplest: highest mock simplicity score; else shortest generated code.
+      let simplest = pickUniqueBest(list, (o) => mock(o, 'simplicity'), 'max');
+      if (!simplest) simplest = pickUniqueBest(list, (o) => codeLen(o), 'min');
+      add(simplest, 'simple', 'Simplest');
+
+      // Lightest: lowest real memory among passing; else highest mock memory score.
+      let lightest = pickUniqueBest(passing, (o) => measured(o, 'memory'), 'min');
+      if (!lightest) lightest = pickUniqueBest(list, (o) => mock(o, 'memory'), 'max');
+      add(lightest, 'light', 'Lightest');
+
+      return pills;
+    }
+
     function renderCards(messageId, options) {
       const wrap = document.createElement('div');
       wrap.className = 'cards';
+      const superlatives = computeSuperlatives(options);
       options.forEach((option, index) => {
         option = option || {};
         const status = String(option.runStatus || 'draft');
@@ -1557,6 +1655,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         pill.textContent = statusLabel;
         meta.appendChild(badge);
         meta.appendChild(pill);
+        (superlatives[String(option.id || '')] || []).forEach(([cls, label]) => {
+          const superPill = document.createElement('span');
+          superPill.className = 'super-pill ' + cls;
+          superPill.textContent = label;
+          meta.appendChild(superPill);
+        });
         const title = document.createElement('span');
         title.className = 'card-title';
         title.textContent = String(option.title || 'Untitled option');
@@ -1982,6 +2086,63 @@ function getWorkspaceContext(): WorkspaceContext {
     selectedText,
     visibleText
   };
+}
+
+// Map a feature prompt to the mock-shop module fixture it most likely targets, so a
+// "Test all" with no runnable cards falls back to the RIGHT module's reference
+// candidates (a checkout prompt -> the checkout fixture), never bait-and-switching
+// to auth.
+function inferMockShopFixtureId(prompt: string | undefined): BenchFixtureId {
+  const text = (prompt || "").toLowerCase();
+  const score = (keywords: string[]): number =>
+    keywords.reduce((n, keyword) => (text.includes(keyword) ? n + 1 : n), 0);
+  const buckets: Array<{ fixtureId: BenchFixtureId; keywords: string[] }> = [
+    { fixtureId: "mock-shop-checkout", keywords: ["checkout.py", "checkout", "cart", "stock", "rollback", "reserve"] },
+    { fixtureId: "mock-shop-payments", keywords: ["payments.py", "payment", "charge", "idempoten", "refund", "card"] },
+    { fixtureId: "mock-shop-db", keywords: ["db.py", "database", "get_user", "case-insensitive", "case insensitive", "email lookup", "lookup"] },
+    { fixtureId: "mock-shop-models", keywords: ["models.py", "model", "dataclass", "validation", "validate", "field", "domain"] },
+    { fixtureId: "mock-shop-auth", keywords: ["auth", "login", "lockout", "rate limit", "rate-limit", "password", "signup", "session"] }
+  ];
+  let best: BenchFixtureId = "mock-shop-auth";
+  let bestScore = 0;
+  for (const bucket of buckets) {
+    const bucketScore = score(bucket.keywords);
+    if (bucketScore > bestScore) {
+      bestScore = bucketScore;
+      best = bucket.fixtureId;
+    }
+  }
+  return best;
+}
+
+// Build runnable fallback cards for a mock-shop module straight from the generated
+// reference registry (each module ships two correct candidates + one flawed
+// control). Used whenever the generated cards can't run, so Test all always has a
+// real, on-topic 2-pass/1-fail comparison to evaluate in Docker.
+function buildMockShopFallbackSuggestions(fixtureId: BenchFixtureId, featureRequest: string): BenchOption[] {
+  const mod = mockShopModuleForFixture(fixtureId) ?? mockShopModuleForFixture("mock-shop-auth");
+  if (!mod) {
+    return [];
+  }
+  const slug =
+    (featureRequest || mod.module).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 28) ||
+    mod.module;
+  const plan = mod.promptHint
+    ? `${mod.promptHint.charAt(0).toUpperCase()}${mod.promptHint.slice(1)}.`
+    : `Rewrite ${mod.targetFile}.`;
+  return mod.candidates.map((candidate) => ({
+    id: `${slug}-${candidate.id}`,
+    title: candidate.title,
+    summary: candidate.summary,
+    implementationPlan: plan,
+    tradeoffs: candidate.tradeoffs,
+    generatedCode: candidate.generatedCode,
+    metrics: candidate.expectPass
+      ? { readability: 86, simplicity: 82, speed: 84, memory: 82, maintainability: 85, testConfidence: 88 }
+      : { readability: 80, simplicity: 84, speed: 86, memory: 84, maintainability: 70, testConfidence: 40 },
+    runStatus: "draft" as const,
+    selected: false
+  }));
 }
 
 function buildFastApiAuthFallbackSuggestions(featureRequest: string): BenchOption[] {
