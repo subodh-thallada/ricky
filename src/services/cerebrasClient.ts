@@ -38,8 +38,11 @@ export class CerebrasClient {
             role: "system",
             content: [
               "You are Bench, a VS Code coding assistant.",
-              "Given a user's feature request and optional editor context, return 3 or 4 genuinely different implementation options.",
+              "Return at least 2 and at most 3 genuinely different implementation options when real tradeoffs exist.",
               "Each option must include a concise title, summary, implementation plan, tradeoffs, and generated code.",
+              "Inside generatedCode, use workspace-relative file sections formatted as ### path followed by a fenced code block.",
+              "You may create new files or change multiple files when needed, but prefer the smallest useful file set.",
+              "Match existing symbols and stubs so Bench can place edits safely instead of duplicating surrounding code.",
               "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.",
               "JSON shape: {\"suggestions\":[{\"id\":\"stable-kebab-id\",\"title\":\"...\",\"summary\":\"...\",\"implementationPlan\":\"...\",\"tradeoffs\":[\"...\"],\"generatedCode\":\"...\"}]}"
             ].join(" ")
@@ -111,7 +114,7 @@ function normalizeSuggestions(suggestions: BenchSuggestion[]): BenchSuggestion[]
     throw new Error("Cerebras returned no usable implementation options.");
   }
 
-  return usable.slice(0, 4).map((suggestion, index) => ({
+  return usable.slice(0, 3).map((suggestion, index) => ({
     ...suggestion,
     id: suggestion.id || `option-${index + 1}`
   }));

@@ -35,7 +35,8 @@ export async function ensureLocalService(spec: LocalServiceSpec): Promise<void> 
 }
 
 export function workspaceRoot(): string | undefined {
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? extensionRoot();
+  // Services and fixtures ship with Bench, not with the repository being edited.
+  return extensionRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
 async function isHealthy(baseUrl: string): Promise<boolean> {

@@ -139,7 +139,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
 def _workspace_from_docker_args(args):
     volume_arg = args[args.index("-v") + 1]
-    return Path(volume_arg.split(":", 1)[0])
+    # Keep the drive-letter colon when tests run on Windows.
+    return Path(volume_arg.rsplit(":", 2)[0])
 
 
 if __name__ == "__main__":

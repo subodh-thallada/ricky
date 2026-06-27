@@ -21,34 +21,19 @@ export class OrchestratorClient {
     await ensureLocalService({
       label: "Bench orchestrator",
       baseUrl,
-      command: ".venv/bin/uvicorn",
-      args: ["bench.main:app", "--host", "127.0.0.1", "--port", "8000"],
+      command: process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python",
+      args: ["-m", "uvicorn", "bench.main:app", "--host", "127.0.0.1", "--port", "8000"],
       logFile: ".bench-logs/orchestrator.log"
     });
-    const endpointRequest = isAuthenticatedEndpointRequest(prompt);
-    const modelPrompt = endpointRequest
-      ? [
-          prompt,
-          "",
-          "Bench runnable fixture contract for this endpoint request:",
-          "Return Python FastAPI implementations only.",
-          "Each generatedCode value must be the complete contents of candidate_target.py.",
-          "Each candidate must define create_app() that returns a FastAPI app.",
-          "The app must expose GET /health and GET /protected.",
-          "GET /protected must require Authorization: Bearer test-token.",
-          "Missing auth must return 401; wrong bearer token must return 403; valid token must return 200 JSON.",
-          "Do not include Markdown fences."
-        ].join("\n")
-      : prompt;
     const response = await fetch(`${baseUrl}/feature-options`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        prompt: modelPrompt,
-        language: endpointRequest ? "python" : workspaceContext.languageId ?? "typescript",
-        active_file_name: workspaceContext.activeFileName,
+        prompt,
+        language: workspaceContext.languageId ?? "typescript",
+        active_file_name: activeRelativePath,
         selected_text: workspaceContext.selectedText,
         visible_text: workspaceContext.visibleText,
         repo_context: workspaceRoot
@@ -74,10 +59,6 @@ export class OrchestratorClient {
       options: rawOptions.map(normalizeOption)
     };
   }
-}
-
-function isAuthenticatedEndpointRequest(prompt: string): boolean {
-  return /auth|authenticated|authorization|bearer|token|endpoint|route|api/i.test(prompt);
 }
 
 function normalizeOption(raw: unknown, index: number): BenchOption {

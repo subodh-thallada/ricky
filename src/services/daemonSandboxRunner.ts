@@ -62,7 +62,7 @@ export class DaemonSandboxRunner {
     await ensureLocalService({
       label: "Bench daemon",
       baseUrl: this.client.baseUrl(),
-      command: ".venv/bin/python",
+      command: process.platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python",
       args: ["-m", "bench_daemon", "serve", "--host", "127.0.0.1", "--port", "8001"],
       logFile: ".bench-logs/daemon.log"
     });
