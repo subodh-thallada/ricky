@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 from bench.clients.cerebras import CerebrasClient
 from bench.schemas import (
@@ -13,6 +14,10 @@ from bench.schemas import (
 )
 from bench.services.context_inference import infer_repo_context
 from bench.services.repo_context import build_repo_context
+
+
+class FeatureOptionsError(ValueError):
+    """Raised when the feature-options model response cannot be used."""
 
 
 class FeatureOptionsService:
@@ -66,7 +71,12 @@ class FeatureOptionsService:
             max_completion_tokens=2200,
             temperature=0.35,
         )
-        suggestions = _parse_options(response.text or "")
+        try:
+            suggestions = _parse_options(response.text or "")
+        except FeatureOptionsError:
+            raise
+        except ValueError as exc:
+            raise FeatureOptionsError("Cerebras response did not include usable feature options.") from exc
         return FeatureOptionsResponse(
             assistant_message=_build_assistant_message(len(suggestions)),
             context_summary=context_summary,
@@ -78,21 +88,24 @@ class FeatureOptionsService:
 
 
 def _parse_options(content: str) -> list[FeatureOption]:
-    cleaned = content.replace("```json", "").replace("```", "").strip()
-    payload = json.loads(cleaned)
-    raw_suggestions = payload.get("suggestions", [])
-    if not isinstance(raw_suggestions, list):
-        raise ValueError("Cerebras response did not contain a suggestions array.")
+    payload = _parse_json_object(content)
+    raw_suggestions = _option_list_from_payload(payload)
+    if not isinstance(raw_suggestions, list) or not raw_suggestions:
+        raise FeatureOptionsError("Cerebras response did not contain a suggestions array.")
 
     options: list[FeatureOption] = []
     for index, item in enumerate(raw_suggestions[:4]):
+        if not isinstance(item, dict):
+            continue
+        raw_tradeoffs = item.get("tradeoffs")
+        tradeoffs = raw_tradeoffs if isinstance(raw_tradeoffs, list) else []
         normalized = {
             "id": item.get("id") or f"option-{index + 1}",
             "title": item.get("title") or f"Option {index + 1}",
             "summary": item.get("summary") or "",
-            "implementationPlan": item.get("implementationPlan") or "",
-            "tradeoffs": item.get("tradeoffs") or [],
-            "generatedCode": item.get("generatedCode") or "",
+            "implementationPlan": item.get("implementationPlan") or item.get("implementation_plan") or "",
+            "tradeoffs": [str(tradeoff) for tradeoff in tradeoffs if str(tradeoff).strip()],
+            "generatedCode": item.get("generatedCode") or item.get("generated_code") or "",
         }
         option = FeatureOption.model_validate(
             {
@@ -104,11 +117,74 @@ def _parse_options(content: str) -> list[FeatureOption]:
                 ).model_dump(by_alias=True),
             }
         )
-        if option.title and option.generated_code:
+        generated_code = getattr(option, "generated_code", getattr(option, "generatedCode", ""))
+        if option.title and generated_code:
             options.append(option)
     if not options:
-        raise ValueError("Cerebras returned no usable implementation options.")
+        raise FeatureOptionsError("Cerebras returned no usable implementation options.")
     return options
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        json_text = _extract_first_json_object(cleaned)
+        if json_text is None:
+            raise FeatureOptionsError("Cerebras response was not valid JSON.")
+        payload = json.loads(json_text)
+    if not isinstance(payload, dict):
+        raise FeatureOptionsError("Cerebras response was not a JSON object.")
+    return payload
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text[start:], start=start):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _option_list_from_payload(payload: dict[str, Any]) -> Any:
+    for key in ("suggestions", "options", "featureOptions", "feature_options", "plans"):
+        raw_options = payload.get(key)
+        if isinstance(raw_options, list):
+            return raw_options
+
+    for key in ("response", "result", "data"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            raw_options = _option_list_from_payload(nested)
+            if isinstance(raw_options, list):
+                return raw_options
+
+    return payload.get("suggestions")
 
 
 def _build_metrics(title: str, summary: str, index: int) -> BenchMetricSet:

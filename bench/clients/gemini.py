@@ -23,6 +23,7 @@ class GeminiClient:
         *,
         max_completion_tokens: int = 512,
         temperature: float = 0.2,
+        response_mime_type: str | None = None,
     ) -> TextGenerationResult:
         stub = _maybe_build_test_response(messages, model_name="gemini-test-stub")
         if stub is not None:
@@ -46,6 +47,8 @@ class GeminiClient:
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
+        if response_mime_type:
+            payload["generationConfig"]["responseMimeType"] = response_mime_type
         if system_chunks:
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_chunks)}]}
 
@@ -132,3 +135,4 @@ def _maybe_build_test_response(
         usage={"stub": True, "totalTokenCount": 0},
         raw={"stub": True},
     )
+

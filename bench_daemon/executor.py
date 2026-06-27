@@ -198,7 +198,7 @@ class BenchOrchestrator:
                 "--pids-limit",
                 "128",
                 "-v",
-                f"{workspace}:/work:ro",
+                f"{_docker_bind_source(workspace)}:/work:ro",
                 "-w",
                 "/work",
                 fixture.docker_image,
@@ -394,6 +394,13 @@ def _resolve_workspace_path(workspace: Path, relative_path: str) -> Path:
     except ValueError as exc:
         raise RuntimeError(f"Candidate file escapes workspace: {relative_path}") from exc
     return target
+
+
+def _docker_bind_source(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.drive:
+        return str(resolved).removeprefix(resolved.drive)
+    return str(resolved)
 
 
 def _container_name(run_id: str, candidate_id: str) -> str:

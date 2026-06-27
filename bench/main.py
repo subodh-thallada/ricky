@@ -20,7 +20,7 @@ from bench.schemas import (
 from bench.services.bench_preview import BenchPreviewService
 from bench.services.chat_router import ChatRouter
 from bench.services.context_inference import infer_repo_context
-from bench.services.feature_options import FeatureOptionsService
+from bench.services.feature_options import FeatureOptionsError, FeatureOptionsService
 from bench.services.thread_chat import ThreadChatService
 from bench.services.thread_store import ThreadStore
 
@@ -57,7 +57,16 @@ async def providers_check() -> dict[str, object]:
 async def feature_options(request: FeatureOptionsRequest) -> FeatureOptionsResponse:
     settings = get_settings()
     service = FeatureOptionsService(CerebrasClient(settings))
-    return await service.generate(request)
+    try:
+        return await service.generate(request)
+    except FeatureOptionsError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "invalid_feature_options_response",
+                "message": str(exc),
+            },
+        ) from exc
 
 
 @app.post("/bench/preview", response_model=BenchRunPreviewResponse)
@@ -186,3 +195,4 @@ async def bench_preview_for_thread(
         conversation_history=thread.messages,
         repo_context=thread.repo_context,
     )
+
