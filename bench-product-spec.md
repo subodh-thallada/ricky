@@ -186,23 +186,32 @@ client = OpenAI(base_url="https://api.cerebras.ai/v1",
                 api_key=os.environ["CEREBRAS_API_KEY"])
 
 resp = client.chat.completions.create(
-    model="llama-4-scout-17b-16e-instruct",   # verify against live catalog
+    model="gpt-oss-120b",            # live catalog (verified 2026-06-27): gpt-oss-120b, zai-glm-4.7
     messages=[{"role": "system", "content": SLOT_PROMPT},
               {"role": "user", "content": agent_code + context}],   # seed = agent's version
-    temperature=0.4, max_tokens=900,
+    temperature=0.4, max_tokens=1200,
+    reasoning_effort="low",          # both live models reason first — keep effort low or content comes back empty
 )
 ```
 
-### Model choices (verify against the live catalog before the demo)
+### Model choices (verified against the live catalog 2026-06-27)
 
-| Role | Suggested model | Why |
+This key exposes **only two models** — `gpt-oss-120b` and `zai-glm-4.7`. Both are
+**reasoning models** (they spend output tokens thinking before emitting content).
+Measured on the real key: `gpt-oss-120b` runs the entire pipeline sub-second with
+`reasoning_effort="low"` (gate 0.6s · alternative 0.2s · harness 0.65s @ ~1,700 tok/s,
+all `finish=stop`). `zai-glm-4.7` returned **empty content** at `max_tokens≤1400` —
+it only emits code with a large budget (`max_tokens ≥ 4000`, ~2.5s, ~1.6k reasoning
+tokens first), so it is a **diversity backup, not the workhorse**.
+
+| Role | Model | Why |
 |---|---|---|
-| Worth-benching gate | **Llama 4 Scout** (or Llama 3.1 8B) | cheap, sub-second classification |
-| Alternative generation | mix of **Llama 4 Maverick**, **Qwen 3 235B**, **GPT-OSS 120B**, **Llama 4 Scout** | quality + genuine approach diversity vs the agent's seed |
-| Harness/test gen | **Llama 4 Scout** | fast, good at structured output |
-| Rank explanation | **Llama 4 Scout** | fast natural-language summary |
+| Worth-benching gate | **gpt-oss-120b** (`reasoning_effort=low`) | ~0.6s, clean JSON |
+| Alternative generation | **gpt-oss-120b** for all 3 slots; optionally 1 slot on **zai-glm-4.7** (`max_tokens≥4000`) for model diversity | the spread is guaranteed by the constrained-slot prompts (§9.2), not by using different models |
+| Harness/test gen | **gpt-oss-120b** | ~1,700 tok/s, good structured output |
+| Rank explanation | **gpt-oss-120b** (`reasoning_effort=low`) | fast NL summary |
 
-> ⚠️ **Deprecation watch:** `llama-3.3-70b` and `qwen-3-32b` were scheduled for deprecation on **2026-02-16** — do **not** hardcode them (the mockup's "llama-3.3-70b" label is illustrative). Pull the live model list on Day 0 and pin current IDs.
+> ⚠️ **Catalog is small and shifts.** Do **not** hardcode `llama-*` / `qwen-*` — they are **not on this key**. Pull the live list on Day 0 (`client.models.list()`) and pin whatever is live; today that is `gpt-oss-120b` + `zai-glm-4.7`. Always give reasoning models headroom (`max_tokens ≥ 600`, glm `≥ 4000`) or `content` comes back `None`.
 
 ---
 
@@ -318,6 +327,7 @@ The headline: **a bench run is tiny** (~11k tokens) and it's even cheaper than a
 **Plan for the credits:**
 - **Develop on the free tier.** ~90 runs/day comfortably covers iteration; no card needed.
 - **Spend the dev credits on the live demo + load test.** They buy (a) **10× rate-limit headroom** so a room of judges hammering it doesn't 429, (b) **priority/lower latency** to protect the 4-second number, and (c) larger context when we feed the agent's surrounding code into prompts. The credits are **insurance on latency and limits**, not raw volume — volume is nearly free.
+- **Budget for reasoning tokens.** Both live models think before answering, so real `completion_tokens` exceed the naked code size. `gpt-oss-120b` at `reasoning_effort="low"` keeps overhead small (measured: gate ~190 out-tok, harness ~1.1k out-tok); `zai-glm-4.7` adds ~1.6k reasoning tokens and roughly doubles output. The ~11k/run estimate holds for low-effort gpt-oss — add headroom if any slot uses glm.
 - Stay **under the 8,192-token context cap** per call on free tier (our calls are ~1–2k). Keep the big benchmark inputs in Docker, never in the prompt.
 
 ### Why the 4 seconds is real (the "why Cerebras" math)
