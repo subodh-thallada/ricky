@@ -1,0 +1,12 @@
+{
+  "id": "fastapi-auth-endpoint",
+  "label": "FastAPI authenticated endpoint",
+  "language": "python",
+  "target_file": "candidate_target.py",
+  "runner": "python bench_runner.py",
+  "dockerfile": "Dockerfile",
+  "docker_context": ".",
+  "docker_image": "bench-fixture-fastapi-auth-endpoint:local",
+  "timeout_ms": 8000,
+  "candidates_dir": "candidates"
+}

@@ -26,6 +26,24 @@ class FixtureTests(unittest.TestCase):
             ["broken_edge_case", "fast", "readable", "slow"],
         )
 
+    def test_loads_fastapi_auth_endpoint_fixture(self):
+        fixture = load_fixture("fastapi-auth-endpoint")
+
+        self.assertEqual(fixture.id, "fastapi-auth-endpoint")
+        self.assertEqual(fixture.target_file, "candidate_target.py")
+        self.assertEqual(fixture.runner, "python bench_runner.py")
+
+    def test_loads_fastapi_auth_endpoint_candidates(self):
+        fixture = load_fixture("fastapi-auth-endpoint")
+
+        candidates = load_candidate_files(fixture)
+
+        self.assertEqual(
+            [candidate.candidate_id for candidate in candidates],
+            ["dependency", "inline", "no_wrong_token_check"],
+        )
+        self.assertIn("def create_app", candidates[0].files["candidate_target.py"])
+
     def test_rejects_candidate_without_target_file(self):
         fixture = load_fixture("python-merge")
 
