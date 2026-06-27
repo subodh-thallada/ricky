@@ -34,13 +34,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   private readonly orchestrator = new OrchestratorClient();
   private readonly sandboxRunner = new DaemonSandboxRunner();
   private readonly applyProvider = new PreviewApplyProvider();
-  private messages: ChatMessage[] = [
-    {
-      id: "welcome",
-      role: "assistant",
-      content: "Tell me what feature you want to build. Gemini will chat, condense context, and score options; Cerebras will write the code for each option. Nothing is applied to your files yet."
-    }
-  ];
+  private messages: ChatMessage[] = [];
   private options: BenchOption[] = [];
   private selectedOptionId?: string;
   private runState?: BenchRunState;
@@ -1111,6 +1105,14 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
   .log-line.system { color: var(--mute); }
   .log-line.error { color: var(--fail); }
   .log-line.success { color: var(--pass); }
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    text-align: center;
+  }
   .logs-empty {
     padding: 16px 12px;
     color: var(--mute);
@@ -1145,7 +1147,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="header">
     <div class="brand">
-      <div class="brand-row"><span class="brand-mark">B</span><span class="title">Bench</span></div>
+      <div class="brand-row"><span class="title">Bench</span></div>
       <div class="sub">AI developer sidepanel</div>
     </div>
     <div class="icons">
@@ -1392,6 +1394,23 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       return Math.max(0, Math.min(100, numberValue)) + '%';
     }
 
+    function resolvePeakMemoryKb(measured) {
+      if (typeof measured.peakMemoryKb === 'number' && Number.isFinite(measured.peakMemoryKb)) {
+        return measured.peakMemoryKb;
+      }
+      if (isRecord(measured.metrics) && typeof measured.metrics.peak_memory_kb === 'number') {
+        return measured.metrics.peak_memory_kb;
+      }
+      return undefined;
+    }
+
+    function formatMemoryKb(kb) {
+      const value = Number(kb);
+      if (!Number.isFinite(value)) return '--';
+      if (value >= 1024) return (value / 1024).toFixed(1) + ' MB';
+      return Math.round(value) + ' KB';
+    }
+
     function render() {
       try {
         inputEl.disabled = Boolean(state.loading);
@@ -1401,6 +1420,12 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
         renderRunBar();
 
         const nextMessages = document.createDocumentFragment();
+        if (!state.messages || state.messages.length === 0) {
+          const emptyState = document.createElement('div');
+          emptyState.className = 'empty-state';
+          emptyState.innerHTML = '<div style="width: 48px; height: 48px; border: 1px solid var(--border-strong); border-radius: 4px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; background: var(--surface-high);"><i class="svg-terminal" style="width: 24px; height: 24px; opacity: 0.8;"></i></div><div style="font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 8px;">Ready to build.</div><div style="font-size: 13px; color: var(--text-soft);">Describe the approach you\\'d like me to test.</div>';
+          nextMessages.appendChild(emptyState);
+        }
         for (const message of state.messages || []) {
           const node = document.createElement('div');
           node.className = 'msg ' + (message.role || 'assistant');
@@ -1571,7 +1596,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       const isPending = status === 'queued' || status === 'running';
       const isFailed = status === 'failed' || status === 'error' || status === 'timeout';
       const pendingLabel = status === 'queued' ? 'Queued' : 'Running...';
-      const routeCount = isRecord(m.metrics) ? m.metrics.endpoint_count : undefined;
+      const peakMemoryKb = resolvePeakMemoryKb(m);
 
       let runVal = 'Not run';
       if (typeof m.durationMs === 'number') runVal = Math.round(m.durationMs) + 'ms';
@@ -1586,11 +1611,10 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       else if (mock.testConfidence !== undefined) testVal = textOrEmpty(mock.testConfidence) + '% (est)';
 
       let memVal = 'Not run';
-      if (routeCount !== undefined && routeCount !== null) memVal = textOrEmpty(routeCount) + ' routes';
-      else if (m.memory !== undefined && m.memory !== null) memVal = textOrEmpty(m.memory);
+      if (peakMemoryKb !== undefined) memVal = formatMemoryKb(peakMemoryKb);
       else if (isPending) memVal = pendingLabel;
       else if (isFailed) memVal = 'Check logs';
-      else if (mock.readability !== undefined) memVal = textOrEmpty(mock.readability) + ' (est)';
+      else if (mock.memory !== undefined) memVal = textOrEmpty(mock.memory) + ' (est)';
 
       let runTitle = 'Runtime';
       let testTitle = tests ? 'Tests (' + tests.passed + '/' + tests.total + ')' : 'Tests';
@@ -1611,12 +1635,11 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       else if (mock.testConfidence !== undefined) testPct = percent(mock.testConfidence);
 
       let memPct = '0%';
-      if (routeCount !== undefined && routeCount !== null) memPct = '100%';
-      else if (m.memory !== undefined && m.memory !== null) memPct = '80%';
+      if (peakMemoryKb !== undefined) memPct = '100%';
       else if (status === 'queued') memPct = '12%';
       else if (status === 'running') memPct = '20%';
       else if (isFailed) memPct = '100%';
-      else if (mock.readability !== undefined) memPct = percent(mock.readability);
+      else if (mock.memory !== undefined) memPct = percent(mock.memory);
 
       const metrics = document.createElement('div');
       metrics.className = 'metrics';
@@ -1652,7 +1675,7 @@ class BenchChatViewProvider implements vscode.WebviewViewProvider {
       const tests = normalizeTests(m.tests);
       const duration = typeof m.durationMs === 'number' ? Math.round(m.durationMs) + 'ms' : '--';
       const testValue = tests ? \`\${tests.passed}/\${tests.total}\` : '--';
-      const memoryValue = m.memory ? escapeHtml(String(m.memory)) : '--';
+      const memoryValue = escapeHtml(formatMemoryKb(resolvePeakMemoryKb(m)));
       const plan = escapeHtml(option.implementationPlan || 'No implementation plan returned.');
       const tradeoffs = Array.isArray(option.tradeoffs) && option.tradeoffs.length
         ? option.tradeoffs.map((item) => '<li>' + escapeHtml(item) + '</li>').join('')

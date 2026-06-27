@@ -42,6 +42,7 @@ class CandidateRecord:
     status: str = "queued"
     exit_code: int | None = None
     duration_ms: float | None = None
+    peak_memory_kb: float | None = None
     tests: dict[str, int] | None = None
     failures: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
@@ -57,6 +58,7 @@ class CandidateRecord:
             "status": self.status,
             "exit_code": self.exit_code,
             "duration_ms": self.duration_ms,
+            "peak_memory_kb": self.peak_memory_kb,
             "tests": self.tests,
             "logs_url": f"/runs/{run_id}/candidates/{self.candidate_id}/logs",
             "code_url": f"/runs/{run_id}/candidates/{self.candidate_id}/code",

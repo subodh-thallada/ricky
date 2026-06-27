@@ -27,6 +27,7 @@ export type DaemonCandidatePayload = {
   status: "passed" | "failed" | "timeout" | "error";
   exit_code: number | null;
   duration_ms: number | null;
+  peak_memory_kb?: number | null;
   tests: { passed: number; failed: number; total: number } | null;
   failures?: Array<Record<string, unknown>>;
   errors?: Array<Record<string, unknown>>;

@@ -1,5 +1,6 @@
 import io
 import json
+import resource
 import sys
 import time
 import traceback
@@ -21,6 +22,17 @@ def _failure_payload(items):
             }
         )
     return payload
+
+
+def _peak_memory_kb() -> int | None:
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss = usage.ru_maxrss
+        if sys.platform == "darwin":
+            return int(round(rss / 1024))
+        return int(rss)
+    except Exception:
+        return None
 
 
 def main():
@@ -51,6 +63,7 @@ def main():
                     "failures": _failure_payload(result.failures),
                     "errors": _failure_payload(result.errors),
                     "duration_ms": duration_ms,
+                    "peak_memory_kb": _peak_memory_kb(),
                 },
                 sort_keys=True,
             )
@@ -76,6 +89,7 @@ def main():
                         }
                     ],
                     "duration_ms": duration_ms,
+                    "peak_memory_kb": _peak_memory_kb(),
                 },
                 sort_keys=True,
             )

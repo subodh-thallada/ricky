@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ class CommandResult:
     stderr: str
     duration_ms: float
     timed_out: bool = False
+    peak_container_memory_kb: float | None = None
 
 
 class BenchOrchestrator:
@@ -228,6 +231,7 @@ class BenchOrchestrator:
                     "status": current.status,
                     "exit_code": current.exit_code,
                     "duration_ms": current.duration_ms,
+                    "peak_memory_kb": current.peak_memory_kb,
                     "tests": current.tests,
                     "failures": current.failures,
                     "errors": current.errors,
@@ -276,6 +280,7 @@ def apply_command_result(candidate: CandidateRecord, result: CommandResult) -> N
     if result.timed_out:
         candidate.status = "timeout"
         candidate.duration_ms = result.duration_ms
+        candidate.peak_memory_kb = result.peak_container_memory_kb
         candidate.logs = _combine_logs(result.stdout, result.stderr)
         candidate.tests = {"passed": 0, "failed": 1, "total": 1}
         return
@@ -296,6 +301,7 @@ def apply_command_result(candidate: CandidateRecord, result: CommandResult) -> N
     candidate.failures = _list_of_dicts(parsed.get("failures"))
     candidate.errors = _list_of_dicts(parsed.get("errors"))
     candidate.metrics = _extract_metrics(parsed)
+    candidate.peak_memory_kb = _resolve_peak_memory_kb(parsed, result)
     candidate.duration_ms = (
         float(duration_ms)
         if isinstance(duration_ms, int | float)
@@ -314,6 +320,38 @@ async def _run_command(
     container_name: str | None = None,
 ) -> CommandResult:
     started = time.perf_counter()
+    peak_container_kb: float | None = None
+    poll_task: asyncio.Task | None = None
+
+    async def poll_container_stats() -> None:
+        nonlocal peak_container_kb
+        assert container_name is not None
+        while True:
+            await asyncio.sleep(0.15)
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "stats",
+                container_name,
+                "--no-stream",
+                "--format",
+                "{{.MemUsage}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout_bytes, _ = await proc.communicate()
+            if proc.returncode != 0:
+                continue
+            usage_kb = _parse_docker_mem_usage(
+                stdout_bytes.decode("utf-8", errors="replace").strip()
+            )
+            if usage_kb is None:
+                continue
+            peak_container_kb = (
+                usage_kb
+                if peak_container_kb is None
+                else max(peak_container_kb, usage_kb)
+            )
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -322,6 +360,9 @@ async def _run_command(
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Command not found: {args[0]}") from exc
+
+    if container_name:
+        poll_task = asyncio.create_task(poll_container_stats())
 
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -333,6 +374,7 @@ async def _run_command(
             stdout=stdout_bytes.decode("utf-8", errors="replace"),
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
             duration_ms=duration_ms,
+            peak_container_memory_kb=peak_container_kb,
         )
     except asyncio.TimeoutError:
         proc.kill()
@@ -346,7 +388,13 @@ async def _run_command(
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
             duration_ms=duration_ms,
             timed_out=True,
+            peak_container_memory_kb=peak_container_kb,
         )
+    finally:
+        if poll_task is not None:
+            poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
 
 
 async def _remove_container(container_name: str) -> None:
@@ -423,6 +471,53 @@ def _extract_metrics(parsed: dict[str, object]) -> dict[str, object]:
         if isinstance(value, dict):
             metrics.update(value)
     return metrics
+
+
+def _extract_peak_memory_kb(parsed: dict[str, object]) -> float | None:
+    value = parsed.get("peak_memory_kb")
+    if isinstance(value, int | float):
+        return float(value)
+    metrics = _extract_metrics(parsed)
+    nested = metrics.get("peak_memory_kb")
+    if isinstance(nested, int | float):
+        return float(nested)
+    return None
+
+
+def _resolve_peak_memory_kb(
+    parsed: dict[str, object], result: CommandResult
+) -> float | None:
+    runner_peak = _extract_peak_memory_kb(parsed)
+    container_peak = result.peak_container_memory_kb
+    if runner_peak is not None and container_peak is not None:
+        return max(runner_peak, container_peak)
+    if runner_peak is not None:
+        return runner_peak
+    return container_peak
+
+
+def _parse_docker_mem_usage(raw: str) -> float | None:
+    if not raw:
+        return None
+    usage_part = raw.split("/", 1)[0].strip()
+    match = re.match(r"^([\d.]+)\s*(B|KiB|MiB|GiB|KB|MB|GB)?$", usage_part)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2) or "B"
+    multipliers = {
+        "B": 1 / 1024,
+        "KiB": 1,
+        "KB": 1,
+        "MiB": 1024,
+        "MB": 1024,
+        "GiB": 1024 * 1024,
+        "GB": 1024 * 1024,
+    }
+    multiplier = multipliers.get(unit)
+    if multiplier is None:
+        return None
+    return round(amount * multiplier, 3)
 
 
 _apply_command_result = apply_command_result

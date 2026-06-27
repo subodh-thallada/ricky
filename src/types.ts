@@ -42,6 +42,7 @@ export type CandidateMeasurement = {
   status: "passed" | "failed" | "timeout" | "error";
   exitCode?: number | null;
   durationMs?: number | null;
+  peakMemoryKb?: number | null;
   tests?: { passed: number; failed: number; total: number } | null;
   failures?: Array<{ test?: string; details?: string }>;
   errors?: Array<Record<string, unknown>>;
