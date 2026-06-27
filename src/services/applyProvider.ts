@@ -34,29 +34,56 @@ const previewDecoration = vscode.window.createTextEditorDecorationType({
 });
 
 export class PreviewApplyProvider implements ApplyProvider {
-  private pending?: PendingSession;
+  private readonly pendingSessions = new Map<string, PendingSession>();
+  private readonly fileOwners = new Map<string, string>();
 
-  async preview(option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult> {
-    if (this.pending) {
-      await this.restorePreview(this.pending);
-    }
+  async preview(sessionId: string, option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult> {
     const session = await this.buildSession(option, workspaceContext);
+    const deactivatedSessionIds: string[] = [];
+
+    for (const artifact of session.artifacts) {
+      const existingOwner = this.fileOwners.get(artifact.targetUri.toString());
+      if (existingOwner && existingOwner !== sessionId) {
+        const existingSession = this.pendingSessions.get(existingOwner);
+        if (existingSession) {
+          await this.restorePreview(existingSession);
+          this.pendingSessions.delete(existingOwner);
+          deactivatedSessionIds.push(existingOwner);
+          for (const existingArtifact of existingSession.artifacts) {
+            this.fileOwners.delete(existingArtifact.targetUri.toString());
+          }
+        }
+      }
+    }
+
+    const existingSession = this.pendingSessions.get(sessionId);
+    if (existingSession) {
+      await this.restorePreview(existingSession);
+      for (const existingArtifact of existingSession.artifacts) {
+        this.fileOwners.delete(existingArtifact.targetUri.toString());
+      }
+    }
+
     await this.showInlinePreview(session);
-    this.pending = session;
+    this.pendingSessions.set(sessionId, session);
+    for (const artifact of session.artifacts) {
+      this.fileOwners.set(artifact.targetUri.toString(), sessionId);
+    }
 
     return {
       optionId: option.id,
       fileCount: session.artifacts.length,
-      summary: `Loaded preview into ${session.artifacts[0]?.displayPath ?? "the active file"} as unsaved changes.`
+      summary: `Loaded preview into ${session.artifacts[0]?.displayPath ?? "the active file"} as unsaved changes.`,
+      deactivatedSessionIds
     };
   }
 
-  async applySelected(): Promise<ApplyResult | undefined> {
-    if (!this.pending) {
+  async applySelected(sessionId: string): Promise<ApplyResult | undefined> {
+    const session = this.pendingSessions.get(sessionId);
+    if (!session) {
       return undefined;
     }
 
-    const session = this.pending;
     for (const artifact of session.artifacts) {
       const document = await vscode.workspace.openTextDocument(artifact.targetUri);
       if (document.getText() !== artifact.proposedContent) {
@@ -72,7 +99,10 @@ export class PreviewApplyProvider implements ApplyProvider {
     }
 
     await this.revealFirstArtifact(session.artifacts[0]);
-    this.pending = undefined;
+    this.pendingSessions.delete(sessionId);
+    for (const artifact of session.artifacts) {
+      this.fileOwners.delete(artifact.targetUri.toString());
+    }
 
     return {
       optionId: session.optionId,
@@ -81,28 +111,31 @@ export class PreviewApplyProvider implements ApplyProvider {
     };
   }
 
-  async rejectSelected(): Promise<string | undefined> {
-    if (!this.pending) {
+  async rejectSelected(sessionId: string): Promise<string | undefined> {
+    const session = this.pendingSessions.get(sessionId);
+    if (!session) {
       return undefined;
     }
 
-    const session = this.pending;
     await this.restorePreview(session);
-    this.pending = undefined;
+    this.pendingSessions.delete(sessionId);
+    for (const artifact of session.artifacts) {
+      this.fileOwners.delete(artifact.targetUri.toString());
+    }
     return `Restored ${session.artifacts[0]?.displayPath ?? "the file"} to its pre-preview contents.`;
   }
 
-  getPendingOptionId(): string | undefined {
-    return this.pending?.optionId;
+  hasPendingSession(sessionId: string): boolean {
+    return this.pendingSessions.has(sessionId);
   }
 
   private async buildSession(option: BenchOption, workspaceContext: WorkspaceContext): Promise<PendingSession> {
     const explicitArtifacts = parseExplicitArtifacts(option.generatedCode);
     const artifacts = shouldPreferActiveEditor(explicitArtifacts, workspaceContext)
-      ? await this.buildEditorArtifact(explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext)
+      ? await this.buildInferredArtifact(option, explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext)
       : explicitArtifacts.some((artifact) => artifact.relativePath)
         ? await this.buildExplicitArtifacts(explicitArtifacts)
-        : await this.buildEditorArtifact(explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext);
+        : await this.buildInferredArtifact(option, explicitArtifacts[0]?.content ?? option.generatedCode, workspaceContext);
 
     if (!artifacts.length) {
       throw new Error("Bench could not determine where to preview this code.");
@@ -144,39 +177,35 @@ export class PreviewApplyProvider implements ApplyProvider {
     return pending;
   }
 
-  private async buildEditorArtifact(code: string, workspaceContext: WorkspaceContext): Promise<PendingArtifact[]> {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
+  private async buildInferredArtifact(
+    option: BenchOption,
+    code: string,
+    workspaceContext: WorkspaceContext
+  ): Promise<PendingArtifact[]> {
+    const target = await inferTargetDocument(option, code, workspaceContext);
+    if (!target) {
       throw new Error("Open the file you want Bench to modify, or return code with explicit file paths.");
     }
 
-    const document = editor.document;
+    const { document, displayPath, selection } = target;
     const originalContent = document.getText();
-    const selection = editor.selection;
-    const proposedContent = selection.isEmpty
-      ? insertAtCursor(originalContent, document.offsetAt(selection.active), code)
-      : replaceSelection(
-          originalContent,
-          document.offsetAt(selection.start),
-          document.offsetAt(selection.end),
-          code
-        );
+    const placement = inferPlacementRange(document, code, selection);
+    const proposedContent = replaceSelection(
+      originalContent,
+      placement.startOffset,
+      placement.endOffset,
+      code
+    );
 
     return [
       {
         targetUri: document.uri,
-        displayPath: workspaceContext.activeFileName
-          ? vscode.workspace.asRelativePath(workspaceContext.activeFileName, false)
-          : path.basename(document.uri.fsPath),
+        displayPath,
         language: document.languageId,
         originalContent,
         proposedContent,
-        previewStartOffset: selection.isEmpty ? document.offsetAt(selection.active) : document.offsetAt(selection.start),
-        previewEndOffset: (
-          selection.isEmpty
-            ? document.offsetAt(selection.active) + trimTrailingWhitespace(code).length
-            : document.offsetAt(selection.start) + trimTrailingWhitespace(code).length
-        )
+        previewStartOffset: placement.startOffset,
+        previewEndOffset: placement.startOffset + trimTrailingWhitespace(code).length
       }
     ];
   }
@@ -352,13 +381,6 @@ function replaceSelection(source: string, start: number, end: number, code: stri
   return `${source.slice(0, start)}${trimTrailingWhitespace(code)}${source.slice(end)}`;
 }
 
-function insertAtCursor(source: string, offset: number, code: string): string {
-  const trimmedCode = trimTrailingWhitespace(code);
-  const prefix = offset > 0 && source[offset - 1] !== "\n" ? "\n" : "";
-  const suffix = offset < source.length && source[offset] !== "\n" ? "\n" : "";
-  return `${source.slice(0, offset)}${prefix}${trimmedCode}${suffix}${source.slice(offset)}`;
-}
-
 function trimTrailingWhitespace(value: string): string {
   return value.replace(/\s+$/u, "");
 }
@@ -410,3 +432,299 @@ function shouldPreferActiveEditor(
   const genericGeneratedPrefixes = ["src/generated/", "generated/", "bench_preview/"];
   return genericGeneratedPrefixes.some((prefix) => normalizedTarget.startsWith(prefix));
 }
+
+type TargetDocument = {
+  document: vscode.TextDocument;
+  displayPath: string;
+  selection?: vscode.Selection;
+};
+
+type PlacementRange = {
+  startOffset: number;
+  endOffset: number;
+};
+
+async function inferTargetDocument(
+  option: BenchOption,
+  code: string,
+  workspaceContext: WorkspaceContext
+): Promise<TargetDocument | undefined> {
+  const activeEditor = vscode.window.activeTextEditor;
+  const declaredSymbols = extractDeclaredSymbols(code);
+  const desiredLanguage = workspaceContext.languageId ?? inferLanguageFromCode(code) ?? activeEditor?.document.languageId;
+
+  const candidates: TargetDocument[] = [];
+  if (activeEditor) {
+    candidates.push({
+      document: activeEditor.document,
+      displayPath: workspaceContext.activeFileName
+        ? vscode.workspace.asRelativePath(workspaceContext.activeFileName, false)
+        : path.basename(activeEditor.document.uri.fsPath),
+      selection: activeEditor.selection
+    });
+  }
+
+  const workspaceFiles = await findWorkspaceCandidateFiles(desiredLanguage);
+  for (const uri of workspaceFiles) {
+    if (activeEditor && uri.toString() === activeEditor.document.uri.toString()) {
+      continue;
+    }
+    const document = await vscode.workspace.openTextDocument(uri);
+    candidates.push({
+      document,
+      displayPath: vscode.workspace.asRelativePath(uri, false)
+    });
+  }
+
+  const ranked = candidates
+    .map((candidate) => ({
+      candidate,
+      score: scoreTargetDocument(candidate, option, declaredSymbols, desiredLanguage)
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.candidate;
+}
+
+async function findWorkspaceCandidateFiles(languageId?: string): Promise<vscode.Uri[]> {
+  const extension = extensionForLanguage(languageId);
+  if (!extension) {
+    return [];
+  }
+  return vscode.workspace.findFiles(
+    `**/*${extension}`,
+    "**/{node_modules,.git,dist,build,__pycache__,.venv,venv}/**",
+    40
+  );
+}
+
+function scoreTargetDocument(
+  candidate: TargetDocument,
+  option: BenchOption,
+  declaredSymbols: string[],
+  desiredLanguage?: string
+): number {
+  const document = candidate.document;
+  const text = document.getText();
+  const lowerText = text.toLowerCase();
+  const lowerPath = candidate.displayPath.toLowerCase();
+  let score = 0;
+
+  if (vscode.window.activeTextEditor && document.uri.toString() === vscode.window.activeTextEditor.document.uri.toString()) {
+    score += 60;
+  }
+  if (desiredLanguage && document.languageId === desiredLanguage) {
+    score += 20;
+  }
+  if (/notimplementederror|todo|implement me|bench demo/i.test(text)) {
+    score += 25;
+  }
+
+  const promptTokens = extractScoringTokens(`${option.title} ${option.summary} ${option.implementationPlan} ${codeSnippetForScoring(option.generatedCode)}`);
+  for (const token of promptTokens) {
+    if (lowerPath.includes(token)) {
+      score += 8;
+    }
+    if (lowerText.includes(token)) {
+      score += 2;
+    }
+  }
+
+  for (const symbol of declaredSymbols) {
+    if (containsDeclaredSymbol(text, document.languageId, symbol)) {
+      score += 40;
+    }
+  }
+
+  return score;
+}
+
+function inferPlacementRange(
+  document: vscode.TextDocument,
+  code: string,
+  selection?: vscode.Selection
+): PlacementRange {
+  const text = document.getText();
+  if (selection && !selection.isEmpty) {
+    return {
+      startOffset: document.offsetAt(selection.start),
+      endOffset: document.offsetAt(selection.end)
+    };
+  }
+
+  for (const symbol of extractDeclaredSymbols(code)) {
+    const range = findTopLevelSymbolRange(text, document.languageId, symbol);
+    if (range) {
+      return range;
+    }
+  }
+
+  const placeholderRange = findPlaceholderRange(text, document.languageId);
+  if (placeholderRange) {
+    return placeholderRange;
+  }
+
+  const appendOffset = inferAppendOffset(text, document.languageId);
+  return {
+    startOffset: appendOffset,
+    endOffset: appendOffset
+  };
+}
+
+function extractDeclaredSymbols(code: string): string[] {
+  const patterns = [
+    /\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g,
+    /\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b/g,
+    /\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g,
+    /\b(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b/g,
+    /\b(?:export\s+)?interface\s+([A-Za-z_][A-Za-z0-9_]*)\b/g,
+    /\b(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:\(|function)/g,
+  ];
+  const symbols = new Set<string>();
+  for (const pattern of patterns) {
+    for (const match of code.matchAll(pattern)) {
+      if (match[1]) {
+        symbols.add(match[1]);
+      }
+    }
+  }
+  return [...symbols];
+}
+
+function containsDeclaredSymbol(text: string, languageId: string, symbol: string): boolean {
+  return Boolean(findTopLevelSymbolRange(text, languageId, symbol));
+}
+
+function findTopLevelSymbolRange(text: string, languageId: string, symbol: string): PlacementRange | undefined {
+  const escaped = escapeRegExp(symbol);
+  const patterns: RegExp[] = languageId === "python"
+    ? [new RegExp(`^def\\s+${escaped}\\s*\\(`, "m"), new RegExp(`^class\\s+${escaped}\\b`, "m")]
+    : [
+        new RegExp(`^(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}\\s*\\(`, "m"),
+        new RegExp(`^(?:export\\s+)?class\\s+${escaped}\\b`, "m"),
+        new RegExp(`^(?:export\\s+)?interface\\s+${escaped}\\b`, "m"),
+        new RegExp(`^(?:export\\s+)?const\\s+${escaped}\\s*=`, "m")
+      ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match || match.index === undefined) {
+      continue;
+    }
+    const startOffset = match.index;
+    const endOffset = findBlockEnd(text, startOffset, languageId);
+    return { startOffset, endOffset };
+  }
+  return undefined;
+}
+
+function findPlaceholderRange(text: string, languageId: string): PlacementRange | undefined {
+  const patterns = languageId === "python"
+    ? [/^\s*raise\s+NotImplementedError.*$/m, /^\s*pass\s*$/m]
+    : [/^\s*\/\/\s*TODO.*$/m, /^\s*throw\s+new\s+Error\(.*implement.*\)\s*;?$/im];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match || match.index === undefined) {
+      continue;
+    }
+    const lineStart = text.lastIndexOf("\n", match.index) + 1;
+    const lineEndIndex = text.indexOf("\n", match.index + match[0].length);
+    const lineEnd = lineEndIndex === -1 ? text.length : lineEndIndex;
+    return { startOffset: lineStart, endOffset: lineEnd };
+  }
+  return undefined;
+}
+
+function findBlockEnd(text: string, startOffset: number, languageId: string): number {
+  if (languageId === "python") {
+    const startLine = text.slice(0, startOffset).split("\n").length - 1;
+    const lines = text.split("\n");
+    const baseIndent = indentationOf(lines[startLine] ?? "");
+    for (let index = startLine + 1; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!line.trim()) {
+        continue;
+      }
+      const indent = indentationOf(line);
+      if (indent <= baseIndent && /^(def|class)\s+/.test(line.trim())) {
+        return offsetForLine(lines, index);
+      }
+    }
+    return text.length;
+  }
+
+  const nextMatch = /^(?:export\s+)?(?:(?:async\s+)?function|class|interface|const)\s+/m.exec(text.slice(startOffset + 1));
+  if (nextMatch?.index !== undefined) {
+    return startOffset + 1 + nextMatch.index;
+  }
+  return text.length;
+}
+
+function inferAppendOffset(text: string, languageId: string): number {
+  if (languageId === "python") {
+    const importMatches = [...text.matchAll(/^(?:from\s+\S+\s+import\s+.+|import\s+.+)$/gm)];
+    if (importMatches.length) {
+      const last = importMatches[importMatches.length - 1];
+      return text.indexOf("\n", (last.index ?? 0) + last[0].length) + 1;
+    }
+  } else {
+    const importMatches = [...text.matchAll(/^import\s+.+$/gm)];
+    if (importMatches.length) {
+      const last = importMatches[importMatches.length - 1];
+      return text.indexOf("\n", (last.index ?? 0) + last[0].length) + 1;
+    }
+  }
+  return text.length ? `${text}\n`.length - 1 : 0;
+}
+
+function indentationOf(line: string): number {
+  const match = line.match(/^(\s*)/);
+  return match?.[1].length ?? 0;
+}
+
+function offsetForLine(lines: string[], index: number): number {
+  let total = 0;
+  for (let current = 0; current < index; current += 1) {
+    total += lines[current].length + 1;
+  }
+  return total;
+}
+
+function extractScoringTokens(text: string): string[] {
+  return [...new Set((text.toLowerCase().match(/[a-z]{4,}/g) ?? []).filter((token) => !COMMON_TOKENS.has(token)).slice(0, 18))];
+}
+
+function codeSnippetForScoring(code: string): string {
+  return code.slice(0, 400);
+}
+
+function inferLanguageFromCode(code: string): string | undefined {
+  if (/\bdef\s+\w+\s*\(|\bclass\s+\w+\s*:/.test(code)) {
+    return "python";
+  }
+  if (/\bexport\s+|\binterface\s+|\bconst\s+\w+\s*=/.test(code)) {
+    return "typescript";
+  }
+  return undefined;
+}
+
+function extensionForLanguage(languageId?: string): string | undefined {
+  const map: Record<string, string> = {
+    python: ".py",
+    typescript: ".ts",
+    typescriptreact: ".tsx",
+    javascript: ".js",
+    javascriptreact: ".jsx",
+  };
+  return languageId ? map[languageId] : undefined;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const COMMON_TOKENS = new Set([
+  "imple", "implement", "implementation", "function", "feature", "option", "return",
+  "async", "const", "class", "export", "bench", "draft", "using", "with", "that",
+  "from", "this", "into", "then", "they", "have", "your", "will", "code", "plan"
+]);

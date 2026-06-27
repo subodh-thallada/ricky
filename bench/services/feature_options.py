@@ -13,8 +13,9 @@ class FeatureOptionsService:
         self.cerebras = cerebras
 
     async def generate(self, request: FeatureOptionsRequest) -> FeatureOptionsResponse:
+        prompt = _strip_provider_keywords(request.prompt)
         inferred_context = infer_repo_context(
-            prompt=request.prompt,
+            prompt=prompt,
             root_path=request.repo_context.root_path if request.repo_context else ".",
             repo_context=request.repo_context,
             editor_context=_request_to_editor_context(request),
@@ -22,8 +23,8 @@ class FeatureOptionsService:
         repo_snapshot, context_metadata = build_repo_context(inferred_context)
         context_summary = _make_context_summary(context_metadata)
 
-        if "(test)" in request.prompt.lower():
-            suggestions = _build_test_options(request.prompt)
+        if _should_use_test_options(request.prompt):
+            suggestions = _build_test_options(prompt)
             return FeatureOptionsResponse(
                 assistant_message=_build_assistant_message(len(suggestions)),
                 context_summary=context_summary,
@@ -35,17 +36,37 @@ class FeatureOptionsService:
 
         system_prompt = (
             "You are Bench, a VS Code coding assistant.\n"
-            "Given a user's feature request and optional editor context, return 3 or 4 genuinely different implementation options.\n"
+            "Given a user's feature request and optional editor context, return up to 3 genuinely different implementation options.\n"
+            "If there is one clear best implementation and the alternatives would be low-value or artificial, returning just 1 option is allowed.\n"
+            "Prefer multiple options only when they reflect real design choices the user may want to compare.\n"
             "Each option must include a concise title, summary, implementationPlan, tradeoffs, and generatedCode.\n"
+            "Bench UI contract:\n"
+            "- title: short and distinct.\n"
+            "- summary: one brief sentence focused on what makes this option meaningfully different from the other correct options.\n"
+            "- implementationPlan: 2 to 4 sentences with enough detail for the View Details panel.\n"
+            "- tradeoffs: 2 to 4 crisp bullets, including both upsides and downsides.\n"
+            "- generatedCode: production-style code, not pseudocode.\n"
             "When you generate code, prefer file-aware output inside generatedCode using one or more sections in this format:\n"
             "### relative/path.ext\n```language\n...code...\n```\n"
             "Use workspace-relative paths only. If you truly cannot infer a file path, return a single code snippet only.\n"
+            "Placement rules for generatedCode:\n"
+            "- Prefer one focused file when possible so Bench can preview inline.\n"
+            "- If a focused file or active file already appears to contain the target function/class/placeholder, align the code to that file and that symbol.\n"
+            "- If you define a function or class, use the real intended symbol name so Bench can match and replace the correct block locally.\n"
+            "- If you are changing a stub, replace the stub with the final implementation instead of returning surrounding commentary.\n"
+            "- Do not include explanations inside generatedCode.\n"
+            "- Keep imports and helper functions that are actually needed by the implementation.\n"
+            "Option design rules:\n"
+            "- All options should be correct, but each should reflect a real design choice the user may want to compare.\n"
+            "- Avoid returning trivial variants that only rename variables or reorder code.\n"
+            "- Make the differences legible at the card-summary level and concrete in the plan/tradeoffs.\n"
+            "- Return at most 3 options.\n"
             "Return only valid JSON. Do not wrap the response in Markdown. Do not include commentary outside JSON.\n"
             'JSON shape: {"suggestions":[{"id":"stable-kebab-id","title":"...","summary":"...",'
             '"implementationPlan":"...","tradeoffs":["..."],"generatedCode":"..."}]}'
         )
         user_payload = {
-            "featureRequest": request.prompt,
+            "featureRequest": prompt,
             "workspaceContext": {
                 "activeFileName": request.active_file_name,
                 "languageId": request.language,
@@ -53,6 +74,18 @@ class FeatureOptionsService:
                 "visibleText": request.visible_text,
             },
             "repositoryContext": repo_snapshot,
+            "benchContext": {
+                "currentUi": {
+                    "cards_show": ["title", "summary"],
+                    "details_panel_shows": ["metrics", "code", "implementationPlan", "tradeoffs"],
+                    "implement_button_behavior": "loads inline preview into the chosen file before apply",
+                },
+                "placementExpectation": (
+                    "Return code in a shape that helps a local editor heuristic choose the right file "
+                    "and replace the right symbol or placeholder."
+                ),
+                "preferFocusedSingleFile": True,
+            },
         }
         response = await self.cerebras.chat(
             [
@@ -81,7 +114,7 @@ def _parse_options(content: str) -> list[FeatureOption]:
         raise ValueError("Cerebras response did not contain a suggestions array.")
 
     options: list[FeatureOption] = []
-    for index, item in enumerate(raw_suggestions[:4]):
+    for index, item in enumerate(raw_suggestions[:3]):
         normalized = {
             "id": item.get("id") or f"option-{index + 1}",
             "title": item.get("title") or f"Option {index + 1}",
@@ -148,75 +181,25 @@ def _build_assistant_message(option_count: int) -> str:
     )
 
 
+def _should_use_test_options(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return "(test)" in lowered and "(real)" not in lowered
+
+
+def _strip_provider_keywords(prompt: str) -> str:
+    return prompt.replace("(REAL)", "").replace("(real)", "").replace("(TEST)", "").replace("(test)", "").strip()
+
+
 def _build_test_options(prompt: str) -> list[FeatureOption]:
     lowered = prompt.lower()
     if "fibonacci" in lowered:
-        raw = [
-            {
-                "id": "fibonacci-iterative",
-                "title": "Readable iterative Fibonacci",
-                "summary": "Simple loop-based implementation with explicit state transitions.",
-                "implementationPlan": "Add a small helper function with validation and an iterative loop.",
-                "tradeoffs": ["Very readable", "Not the asymptotically fastest possible approach"],
-                "generatedCode": (
-                    "### bench_preview/fibonacci_iterative.py\n"
-                    "```python\n"
-                    "def fibonacci_iterative(n: int) -> int:\n"
-                    "    if n < 0:\n"
-                    "        raise ValueError('n must be non-negative')\n"
-                    "    if n < 2:\n"
-                    "        return n\n"
-                    "    prev_num, curr_num = 0, 1\n"
-                    "    for _ in range(2, n + 1):\n"
-                    "        prev_num, curr_num = curr_num, prev_num + curr_num\n"
-                    "    return curr_num\n"
-                    "```"
-                ),
-            },
-            {
-                "id": "fibonacci-memoized",
-                "title": "Memoized recursive Fibonacci",
-                "summary": "Recursive shape with memoization for repeated subproblems.",
-                "implementationPlan": "Implement a recursive helper with a memo dict seeded with base cases.",
-                "tradeoffs": ["Nice conceptual mapping", "More overhead than iterative for single calls"],
-                "generatedCode": (
-                    "### bench_preview/fibonacci_memoized.py\n"
-                    "```python\n"
-                    "def fibonacci_memoized(n: int, memo: dict[int, int] | None = None) -> int:\n"
-                    "    if n < 0:\n"
-                    "        raise ValueError('n must be non-negative')\n"
-                    "    if memo is None:\n"
-                    "        memo = {0: 0, 1: 1}\n"
-                    "    if n not in memo:\n"
-                    "        memo[n] = fibonacci_memoized(n - 1, memo) + fibonacci_memoized(n - 2, memo)\n"
-                    "    return memo[n]\n"
-                    "```"
-                ),
-            },
-            {
-                "id": "fibonacci-fast-doubling",
-                "title": "Fast-doubling Fibonacci",
-                "summary": "More advanced implementation optimized for fewer recursive steps.",
-                "implementationPlan": "Use the fast-doubling recurrence with a tuple-returning helper.",
-                "tradeoffs": ["Fastest for large n", "Harder to understand at a glance"],
-                "generatedCode": (
-                    "### bench_preview/fibonacci_fast_doubling.py\n"
-                    "```python\n"
-                    "def fibonacci_fast_doubling(n: int) -> int:\n"
-                    "    if n < 0:\n"
-                    "        raise ValueError('n must be non-negative')\n"
-                    "    def _fib(k: int) -> tuple[int, int]:\n"
-                    "        if k == 0:\n"
-                    "            return 0, 1\n"
-                    "        a, b = _fib(k >> 1)\n"
-                    "        c = a * ((b << 1) - a)\n"
-                    "        d = a * a + b * b\n"
-                    "        return (d, c + d) if (k & 1) else (c, d)\n"
-                    "    return _fib(n)[0]\n"
-                    "```"
-                ),
-            },
-        ]
+        raw = _fibonacci_test_options()
+    elif "students" in lowered and "endpoint" in lowered or "get students" in lowered:
+        raw = _students_endpoint_test_options()
+    elif "cache" in lowered or "caching" in lowered:
+        raw = _cache_test_options()
+    elif "validation" in lowered or "validate" in lowered:
+        raw = _validation_test_options()
     else:
         slug = _slugify(prompt)
         output_path = _default_output_path(slug)
@@ -276,6 +259,298 @@ def _build_test_options(prompt: str) -> list[FeatureOption]:
             }
         )
         for index, item in enumerate(raw)
+    ]
+
+
+def _fibonacci_test_options() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "fibonacci-iterative",
+            "title": "Readable iterative Fibonacci",
+            "summary": "Simple loop-based implementation with explicit state transitions.",
+            "implementationPlan": "Add a small helper function with validation and an iterative loop.",
+            "tradeoffs": ["Very readable", "Not the asymptotically fastest possible approach"],
+            "generatedCode": (
+                "### src/fibonacci_demo.py\n"
+                "```python\n"
+                "def fibonacci(n: int) -> int:\n"
+                "    if n < 0:\n"
+                "        raise ValueError('n must be non-negative')\n"
+                "    if n < 2:\n"
+                "        return n\n"
+                "    prev_num, curr_num = 0, 1\n"
+                "    for _ in range(2, n + 1):\n"
+                "        prev_num, curr_num = curr_num, prev_num + curr_num\n"
+                "    return curr_num\n"
+                "```"
+            ),
+        },
+        {
+            "id": "fibonacci-memoized",
+            "title": "Memoized recursive Fibonacci",
+            "summary": "Recursive shape with memoization for repeated subproblems.",
+            "implementationPlan": "Implement a recursive helper with a memo dict seeded with base cases.",
+            "tradeoffs": ["Nice conceptual mapping", "More overhead than iterative for single calls"],
+            "generatedCode": (
+                "### src/fibonacci_demo.py\n"
+                "```python\n"
+                "def fibonacci(n: int, memo: dict[int, int] | None = None) -> int:\n"
+                "    if n < 0:\n"
+                "        raise ValueError('n must be non-negative')\n"
+                "    if memo is None:\n"
+                "        memo = {0: 0, 1: 1}\n"
+                "    if n not in memo:\n"
+                "        memo[n] = fibonacci(n - 1, memo) + fibonacci(n - 2, memo)\n"
+                "    return memo[n]\n"
+                "```"
+            ),
+        },
+        {
+            "id": "fibonacci-fast-doubling",
+            "title": "Fast-doubling Fibonacci",
+            "summary": "More advanced implementation optimized for fewer recursive steps.",
+            "implementationPlan": "Use the fast-doubling recurrence with a tuple-returning helper.",
+            "tradeoffs": ["Fastest for large n", "Harder to understand at a glance"],
+            "generatedCode": (
+                "### src/fibonacci_demo.py\n"
+                "```python\n"
+                "def fibonacci(n: int) -> int:\n"
+                "    if n < 0:\n"
+                "        raise ValueError('n must be non-negative')\n"
+                "    def _fib(k: int) -> tuple[int, int]:\n"
+                "        if k == 0:\n"
+                "            return 0, 1\n"
+                "        a, b = _fib(k >> 1)\n"
+                "        c = a * ((b << 1) - a)\n"
+                "        d = a * a + b * b\n"
+                "        return (d, c + d) if (k & 1) else (c, d)\n"
+                "    return _fib(n)[0]\n"
+                "```"
+            ),
+        },
+    ]
+
+
+def _students_endpoint_test_options() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "students-endpoint-direct",
+            "title": "Direct route with inline filtering",
+            "summary": "Keep the endpoint self-contained with straightforward query-parameter handling.",
+            "implementationPlan": "Implement filtering, limit handling, and response shaping directly in the route function.",
+            "tradeoffs": ["Fastest to ship", "Logic can grow crowded as endpoint behavior expands"],
+            "generatedCode": (
+                "### src/get_students_demo.py\n"
+                "```python\n"
+                "from dataclasses import asdict\n"
+                "\n"
+                "def get_students(search: str | None = None, grade: int | None = None, limit: int = 50) -> list[dict[str, object]]:\n"
+                "    items = STUDENTS\n"
+                "    if search:\n"
+                "        lowered = search.lower()\n"
+                "        items = [student for student in items if lowered in student.name.lower()]\n"
+                "    if grade is not None:\n"
+                "        items = [student for student in items if student.grade == grade]\n"
+                "    return [asdict(student) for student in items[:limit]]\n"
+                "```"
+            ),
+        },
+        {
+            "id": "students-endpoint-service",
+            "title": "Service-layer endpoint",
+            "summary": "Move query behavior into a dedicated service function so the route stays thin.",
+            "implementationPlan": "Add a small query service helper and keep the route focused on HTTP input/output concerns.",
+            "tradeoffs": ["Cleaner separation", "Slightly more indirection for a small app"],
+            "generatedCode": (
+                "### src/get_students_demo.py\n"
+                "```python\n"
+                "from dataclasses import asdict\n"
+                "\n"
+                "def query_students(search: str | None, grade: int | None, limit: int) -> list[Student]:\n"
+                "    results = STUDENTS\n"
+                "    if search:\n"
+                "        lowered = search.lower()\n"
+                "        results = [student for student in results if lowered in student.name.lower()]\n"
+                "    if grade is not None:\n"
+                "        results = [student for student in results if student.grade == grade]\n"
+                "    return results[:limit]\n"
+                "\n"
+                "def get_students(search: str | None = None, grade: int | None = None, limit: int = 50) -> list[dict[str, object]]:\n"
+                "    return [asdict(student) for student in query_students(search, grade, limit)]\n"
+                "```"
+            ),
+        },
+        {
+            "id": "students-endpoint-spec",
+            "title": "Specification-style endpoint",
+            "summary": "Compose reusable predicate functions so future filters can be added without rewriting the route.",
+            "implementationPlan": "Build a list of predicate callables, apply them to the dataset, and serialize the filtered result.",
+            "tradeoffs": ["Best for growing filter sets", "More abstract than most small demos need"],
+            "generatedCode": (
+                "### src/get_students_demo.py\n"
+                "```python\n"
+                "from dataclasses import asdict\n"
+                "from typing import Callable\n"
+                "\n"
+                "def get_students(search: str | None = None, grade: int | None = None, limit: int = 50) -> list[dict[str, object]]:\n"
+                "    predicates: list[Callable[[Student], bool]] = []\n"
+                "    if search:\n"
+                "        lowered = search.lower()\n"
+                "        predicates.append(lambda student: lowered in student.name.lower())\n"
+                "    if grade is not None:\n"
+                "        predicates.append(lambda student: student.grade == grade)\n"
+                "\n"
+                "    results = [student for student in STUDENTS if all(predicate(student) for predicate in predicates)]\n"
+                "    return [asdict(student) for student in results[:limit]]\n"
+                "```"
+            ),
+        },
+    ]
+
+
+def _cache_test_options() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "cache-dict",
+            "title": "Manual dictionary cache",
+            "summary": "Use an explicit module-level cache for maximum clarity and debugging control.",
+            "implementationPlan": "Add a dict keyed by user id and populate it only on cache miss.",
+            "tradeoffs": ["Very explicit", "You manage eviction and invalidation yourself"],
+            "generatedCode": (
+                "### src/cache_profiles_demo.py\n"
+                "```python\n"
+                "_PROFILE_CACHE: dict[int, dict[str, object]] = {}\n"
+                "\n"
+                "def get_user_profile(user_id: int) -> dict[str, object]:\n"
+                "    if user_id in _PROFILE_CACHE:\n"
+                "        return _PROFILE_CACHE[user_id]\n"
+                "    profile = fetch_profile_from_source(user_id)\n"
+                "    _PROFILE_CACHE[user_id] = profile\n"
+                "    return profile\n"
+                "```"
+            ),
+        },
+        {
+            "id": "cache-lru",
+            "title": "Decorator-based LRU cache",
+            "summary": "Lean on the standard library for a compact and correct memoization approach.",
+            "implementationPlan": "Wrap the profile fetch function with functools.lru_cache and return immutable-ish payloads.",
+            "tradeoffs": ["Tiny implementation", "Less control over per-entry invalidation"],
+            "generatedCode": (
+                "### src/cache_profiles_demo.py\n"
+                "```python\n"
+                "from functools import lru_cache\n"
+                "\n"
+                "@lru_cache(maxsize=128)\n"
+                "def get_user_profile(user_id: int) -> dict[str, object]:\n"
+                "    return fetch_profile_from_source(user_id)\n"
+                "```"
+            ),
+        },
+        {
+            "id": "cache-stale-aware",
+            "title": "Timestamp-aware cache entries",
+            "summary": "Store values with freshness metadata so you can choose between speed and staleness tolerance.",
+            "implementationPlan": "Cache `(timestamp, value)` pairs and refetch when the entry ages out.",
+            "tradeoffs": ["Better real-world behavior", "More moving parts than simple memoization"],
+            "generatedCode": (
+                "### src/cache_profiles_demo.py\n"
+                "```python\n"
+                "import time\n"
+                "\n"
+                "_PROFILE_CACHE: dict[int, tuple[float, dict[str, object]]] = {}\n"
+                "_TTL_SECONDS = 30.0\n"
+                "\n"
+                "def get_user_profile(user_id: int) -> dict[str, object]:\n"
+                "    cached = _PROFILE_CACHE.get(user_id)\n"
+                "    now = time.time()\n"
+                "    if cached and now - cached[0] < _TTL_SECONDS:\n"
+                "        return cached[1]\n"
+                "    profile = fetch_profile_from_source(user_id)\n"
+                "    _PROFILE_CACHE[user_id] = (now, profile)\n"
+                "    return profile\n"
+                "```"
+            ),
+        },
+    ]
+
+
+def _validation_test_options() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "validation-fail-fast",
+            "title": "Fail-fast validation",
+            "summary": "Raise the first validation issue immediately for simple and readable control flow.",
+            "implementationPlan": "Check each field in order and raise a ValueError as soon as something is invalid.",
+            "tradeoffs": ["Simple behavior", "User only sees one issue at a time"],
+            "generatedCode": (
+                "### src/validation_demo.py\n"
+                "```python\n"
+                "def validate_student_payload(payload: dict[str, object]) -> dict[str, object]:\n"
+                "    name = str(payload.get('name', '')).strip()\n"
+                "    if not name:\n"
+                "        raise ValueError('name is required')\n"
+                "    grade = payload.get('grade')\n"
+                "    if not isinstance(grade, int) or grade < 1 or grade > 12:\n"
+                "        raise ValueError('grade must be an integer from 1 to 12')\n"
+                "    email = str(payload.get('email', '')).strip()\n"
+                "    if '@' not in email:\n"
+                "        raise ValueError('email must contain @')\n"
+                "    return {'name': name, 'grade': grade, 'email': email.lower()}\n"
+                "```"
+            ),
+        },
+        {
+            "id": "validation-collect-all",
+            "title": "Collect-all validation errors",
+            "summary": "Return every validation issue at once so the caller can fix the whole payload in one pass.",
+            "implementationPlan": "Accumulate field-specific errors in a dict and raise once after all checks complete.",
+            "tradeoffs": ["Best UX for forms", "Slightly more code than fail-fast"],
+            "generatedCode": (
+                "### src/validation_demo.py\n"
+                "```python\n"
+                "def validate_student_payload(payload: dict[str, object]) -> dict[str, object]:\n"
+                "    errors: dict[str, str] = {}\n"
+                "    name = str(payload.get('name', '')).strip()\n"
+                "    if not name:\n"
+                "        errors['name'] = 'name is required'\n"
+                "    grade = payload.get('grade')\n"
+                "    if not isinstance(grade, int) or not 1 <= grade <= 12:\n"
+                "        errors['grade'] = 'grade must be an integer from 1 to 12'\n"
+                "    email = str(payload.get('email', '')).strip()\n"
+                "    if '@' not in email:\n"
+                "        errors['email'] = 'email must contain @'\n"
+                "    if errors:\n"
+                "        raise ValueError(errors)\n"
+                "    return {'name': name, 'grade': grade, 'email': email.lower()}\n"
+                "```"
+            ),
+        },
+        {
+            "id": "validation-normalize",
+            "title": "Normalization-first validation",
+            "summary": "Normalize the payload into a clean structure while validating, which works well for downstream code.",
+            "implementationPlan": "Create a normalized output dict, sanitize each field, and reject invalid values before returning.",
+            "tradeoffs": ["Great downstream ergonomics", "Can feel more indirect during debugging"],
+            "generatedCode": (
+                "### src/validation_demo.py\n"
+                "```python\n"
+                "def validate_student_payload(payload: dict[str, object]) -> dict[str, object]:\n"
+                "    normalized = {\n"
+                "        'name': str(payload.get('name', '')).strip().title(),\n"
+                "        'email': str(payload.get('email', '')).strip().lower(),\n"
+                "        'grade': payload.get('grade'),\n"
+                "    }\n"
+                "    if not normalized['name']:\n"
+                "        raise ValueError('name is required')\n"
+                "    if not isinstance(normalized['grade'], int) or not 1 <= normalized['grade'] <= 12:\n"
+                "        raise ValueError('grade must be an integer from 1 to 12')\n"
+                "    if '@' not in normalized['email']:\n"
+                "        raise ValueError('email must contain @')\n"
+                "    return normalized\n"
+                "```"
+            ),
+        },
     ]
 
 

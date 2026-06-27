@@ -28,6 +28,9 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   options?: BenchOption[];
+  appliedOptionId?: string;
+  appliedOptionTitle?: string;
+  appliedSummary?: string;
 };
 
 export type WorkspaceContext = {
@@ -49,6 +52,7 @@ export type ApplyPreviewResult = {
   optionId: string;
   fileCount: number;
   summary: string;
+  deactivatedSessionIds?: string[];
 };
 
 export type ApplyResult = {
@@ -58,8 +62,8 @@ export type ApplyResult = {
 };
 
 export interface ApplyProvider {
-  preview(option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult>;
-  applySelected(): Promise<ApplyResult | undefined>;
-  rejectSelected(): Promise<string | undefined>;
-  getPendingOptionId(): string | undefined;
+  preview(sessionId: string, option: BenchOption, workspaceContext: WorkspaceContext): Promise<ApplyPreviewResult>;
+  applySelected(sessionId: string): Promise<ApplyResult | undefined>;
+  rejectSelected(sessionId: string): Promise<string | undefined>;
+  hasPendingSession(sessionId: string): boolean;
 }
