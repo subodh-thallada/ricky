@@ -1,0 +1,20 @@
+[project]
+name = "bench-orchestrator"
+version = "0.1.0"
+description = "Bench hackathon bootstrap service"
+requires-python = ">=3.11"
+dependencies = [
+    "backboard-sdk>=0.1.0",
+    "cerebras_cloud_sdk>=1.0.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "pydantic-settings>=2.6.0",
+    "uvicorn>=0.34.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bench*"]
