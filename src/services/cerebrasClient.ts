@@ -33,6 +33,8 @@ export class CerebrasClient {
         model,
         temperature: 0.35,
         max_tokens: 2600,
+        response_format: { type: "json_object" },
+        disable_reasoning: true,
         messages: [
           {
             role: "system",

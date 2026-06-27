@@ -141,8 +141,28 @@ class FeatureOptionsService:
             ],
             max_completion_tokens=2200,
             temperature=0.35,
+            response_format={"type": "json_object"},
+            disable_reasoning=True,
         )
-        return response, _parse_options(response.text or "")
+        suggestions = _parse_options(response.text or "")
+        if not _is_raw_fallback(suggestions):
+            return response, suggestions
+
+        retry_response = await self.cerebras.chat(
+            [
+                {
+                    "role": "system",
+                    "content": _build_system_prompt()
+                    + "\nYour previous response was malformed. Return one valid JSON object and nothing else.",
+                },
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+            max_completion_tokens=2200,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            disable_reasoning=True,
+        )
+        return retry_response, _parse_options(retry_response.text or "")
 
 
 def _parse_options(content: str) -> list[FeatureOption]:
@@ -183,6 +203,10 @@ def _parse_options(content: str) -> list[FeatureOption]:
     if not options:
         return [_build_raw_code_option(cleaned)]
     return options
+
+
+def _is_raw_fallback(options: list[FeatureOption]) -> bool:
+    return len(options) == 1 and options[0].id == "cerebras-draft"
 
 
 def _strip_outer_json_fence(content: str) -> str:

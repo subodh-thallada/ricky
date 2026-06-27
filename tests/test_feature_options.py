@@ -112,6 +112,37 @@ class FeatureOptionsRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.options), 1)
         self.assertEqual(response.options[0].id, "focused")
 
+    async def test_malformed_provider_response_gets_one_structured_retry(self):
+        class FakeClient:
+            calls = 0
+            response_formats: list[object] = []
+            disable_reasoning_values: list[object] = []
+
+            async def chat(self, *args, **kwargs):
+                self.calls += 1
+                self.response_formats.append(kwargs.get("response_format"))
+                self.disable_reasoning_values.append(kwargs.get("disable_reasoning"))
+                if self.calls == 1:
+                    return SimpleNamespace(model="zai-glm-4.7", text="Here is the code: def broken(): pass")
+                return SimpleNamespace(
+                    model="zai-glm-4.7",
+                    text='{"suggestions":[{"id":"recovered","title":"Recovered","summary":"Valid JSON.","implementationPlan":"Apply it.","tradeoffs":["One retry"],"generatedCode":"def recovered():\\n    return True\\n"}]}',
+                )
+
+        client = FakeClient()
+        with TemporaryDirectory() as tmpdir:
+            response = await FeatureOptionsService(client).generate(
+                FeatureOptionsRequest(
+                    prompt="Implement a parser-safe change",
+                    repo_context=RepoContextConfig(root_path=tmpdir),
+                )
+            )
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.response_formats, [{"type": "json_object"}, {"type": "json_object"}])
+        self.assertEqual(client.disable_reasoning_values, [True, True])
+        self.assertEqual(response.options[0].id, "recovered")
+
     def test_parse_options_recovers_complete_options_from_truncated_response(self):
         truncated = (
             '{'

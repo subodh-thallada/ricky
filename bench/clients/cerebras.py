@@ -32,6 +32,8 @@ class CerebrasClient:
         max_completion_tokens: int = 128,
         reasoning_effort: str = "low",
         temperature: float = 0.2,
+        response_format: dict[str, str] | None = None,
+        disable_reasoning: bool | None = None,
     ) -> TextGenerationResult:
         stub = _maybe_build_test_response(messages, model_name="cerebras-test-stub")
         if stub is not None:
@@ -40,12 +42,20 @@ class CerebrasClient:
         client = self._client()
 
         def _run() -> Any:
+            request: dict[str, Any] = {
+                "model": self.settings.cerebras_model,
+                "messages": messages,
+                "max_completion_tokens": max_completion_tokens,
+                "temperature": temperature,
+            }
+            if disable_reasoning is not True:
+                request["reasoning_effort"] = reasoning_effort
+            if response_format is not None:
+                request["response_format"] = response_format
+            if disable_reasoning is not None:
+                request["disable_reasoning"] = disable_reasoning
             return client.chat.completions.create(
-                model=self.settings.cerebras_model,
-                messages=messages,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_effort=reasoning_effort,
-                temperature=temperature,
+                **request,
             )
 
         try:
